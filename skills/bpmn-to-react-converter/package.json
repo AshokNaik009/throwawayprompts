@@ -1,0 +1,37 @@
+{
+  "name": "bpmn-to-react-converter-skill",
+  "version": "1.0.0",
+  "description": "Convert IBM BPM/Camunda BPMN XML to React and Node.js",
+  "scripts": {
+    "analyze": "node scripts/analyze-bpmn.js",
+    "analyze:twx": "node scripts/analyze-twx-directory.js",
+    "extract": "node scripts/extract-components.js",
+    "extract:twx": "node scripts/extract-twx.js",
+    "generate:react": "node scripts/generate-react-components.js",
+    "generate:node": "node scripts/generate-node-services.js",
+    "test": "echo 'No tests configured yet'"
+  },
+  "keywords": [
+    "bpmn",
+    "ibm-bpm",
+    "camunda",
+    "react",
+    "nodejs",
+    "conversion",
+    "migration",
+    "teamworks"
+  ],
+  "dependencies": {
+    "fast-xml-parser": "^4.3.0",
+    "sax": "^1.3.0",
+    "xml2js": "^0.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/sax": "^1.2.0",
+    "@types/xml2js": "^0.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
