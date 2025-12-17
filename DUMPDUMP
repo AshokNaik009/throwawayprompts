@@ -1,0 +1,137 @@
+---
+ allowed-tools: Read, Write, Edit, Bash, Glob, Grep
+ argument-hint: [task-description]
+ description: Auto-generate slash commands AND subagents based on task description. Creates complete workflow automation.
+ ---
+
+ # Workflow Generator
+
+ Generate a complete workflow automation based on: **$ARGUMENTS**
+
+ ## Current Project Context
+
+ - Existing commands: !`ls -la .claude/commands/ 2>/dev/null || echo "No commands directory"`
+ - Existing agents: !`ls -la .claude/agents/ 2>/dev/null || echo "No agents directory"`
+ - Project type: @package.json or @requirements.txt or @go.mod or @Cargo.toml
+ - Project structure: !`find . -maxdepth 2 -type d | head -20`
+
+ ## Task
+
+ Based on the task description "$ARGUMENTS", I will:
+
+ 1. **Analyze the requirement** and determine what automation is needed
+ 2. **Create a specialized subagent** with domain expertise for this task
+ 3. **Create a slash command** that leverages the agent and provides quick access
+ 4. **Ensure both work together** seamlessly
+
+ ## Generation Process
+
+ ### Step 1: Ensure Directories Exist
+
+ ```bash
+ mkdir -p .claude/commands
+ mkdir -p .claude/agents
+ ```
+
+ ### Step 2: Analyze Task Requirements
+
+ Based on "$ARGUMENTS", determine:
+ - **Domain**: What area of expertise is needed?
+ - **Tools Required**: Which tools should be available?
+ - **Automation Level**: What should be automated vs interactive?
+ - **Output Format**: What deliverables are expected?
+
+ ### Step 3: Generate Subagent
+
+ Create a specialized agent in `.claude/agents/` with:
+
+ ```markdown
+ ---
+ name: [task-specific-name]
+ description: [Expertise description]. Use PROACTIVELY when [trigger conditions].
+ tools: [relevant tools based on task]
+ model: sonnet
+ ---
+
+ [Detailed system prompt with:]
+ - Role definition
+ - Process/methodology
+ - Quality standards
+ - Output format
+ ```
+
+ ### Step 4: Generate Slash Command
+
+ Create a command in `.claude/commands/` with:
+
+ ```markdown
+ ---
+ allowed-tools: [matching tools]
+ argument-hint: [relevant arguments]
+ description: [Action-oriented description]
+ ---
+
+ [Command prompt with:]
+ - Context gathering (bash commands, file references)
+ - Clear task instructions
+ - Integration with the generated agent
+ - Expected deliverables
+ ```
+
+ ## Naming Conventions
+
+ - **Agent name**: `[domain]-[role]` (e.g., `api-tester`, `security-reviewer`)
+ - **Command name**: `[action]-[target]` (e.g., `test-api`, `review-security`)
+
+ ## Tool Selection Guide
+
+ | Task Type | Recommended Tools |
+ |-----------|-------------------|
+ | Code Analysis | Read, Grep, Glob |
+ | Code Modification | Read, Edit, Write |
+ | Testing | Read, Edit, Bash, Write |
+ | Git Operations | Bash(git:*), Read |
+ | Documentation | Read, Write, WebSearch |
+ | Security | Read, Grep, Bash |
+ | Performance | Read, Bash, Grep |
+ | API Work | Read, Edit, Bash, WebFetch |
+
+ ## Output
+
+ After analyzing "$ARGUMENTS", I will create:
+
+ 1. **Agent file**: `.claude/agents/[name].md`
+ 2. **Command file**: `.claude/commands/[name].md`
+ 3. **Usage instructions** for both
+
+ ## Examples of What Can Be Generated
+
+ ### Example 1: "API endpoint testing"
+ - Agent: `api-test-specialist.md` - Expert in REST/GraphQL testing
+ - Command: `test-endpoint.md` - Quick API testing with `/test-endpoint [url]`
+
+ ### Example 2: "Database migration management"
+ - Agent: `migration-specialist.md` - Expert in schema changes and rollbacks
+ - Command: `migrate.md` - Run migrations with `/migrate [action]`
+
+ ### Example 3: "Code review for security"
+ - Agent: `security-reviewer.md` - OWASP-focused security expert
+ - Command: `security-review.md` - Audit code with `/security-review [file]`
+
+ ### Example 4: "Documentation generation"
+ - Agent: `docs-writer.md` - Technical writing specialist
+ - Command: `generate-docs.md` - Create docs with `/generate-docs [target]`
+
+ ## Validation
+
+ After generation, I will:
+ 1. Verify files were created successfully
+ 2. Show the generated content for review
+ 3. Provide usage examples
+ 4. Suggest improvements or additions
+
+ ---
+
+ Now analyzing your task: **$ARGUMENTS**
+
+ I'll create the most appropriate agent and command combination for this workflow.
