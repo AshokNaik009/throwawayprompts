@@ -1,0 +1,41 @@
+BASIC (Beginner-Friendly)
+1. Be Specific and Give Context Don't throw vague prompts at Claude. Treat it like a brilliant new employee who knows nothing about your project. The more detail you provide, the better the output.
+
+Instead of: "Fix my code" Try: "Fix the login bug in auth.js — users get a 403 error after clicking 'Sign In' with valid credentials. Here's the error log: ..."
+
+2. Assign a Role Giving Claude a persona dramatically improves response quality and tone. Reddit users consistently report this as the simplest high-impact trick.
+
+Example: "You are a senior backend engineer with 10 years of experience in Node.js. Review this API endpoint for security vulnerabilities and performance issues."
+
+3. Iterate Instead of Expecting Perfection A common Reddit lesson: stop trying to craft the "perfect prompt." Give Claude context, get a response, then refine. Working with the output beats rewriting your prompt 10 times.
+
+Example: Send your first draft, then follow up with: "Good start, but make the tone more casual, shorten the intro, and add a real-world analogy for the second paragraph."
+
+MEDIUM (Intermediate)
+4. Use XML Tags to Structure Your Prompts Claude responds especially well to XML-tagged inputs. It helps separate your instructions from your data and reduces confusion — a tip straight from Anthropic's own API docs.
+
+Example:
+
+<instructions>Summarize the key findings</instructions>
+<data>...paste your report here...</data>
+<format>3 bullet points, no jargon</format>
+5. Ask Claude to Plan Before Executing Reddit users found that recreating Claude Code's "Plan Mode" in regular chat produces much stronger results. Force Claude to think before it builds.
+
+Example: "This is a complex task. Before you write any code, outline your approach step-by-step. List what files you'll change, what edge cases to watch for, and what tests you'd write. Then wait for my approval before coding."
+
+6. Reduce Hallucinations with Explicit Guardrails A Reddit user (ColdPlankton9273) found three anti-hallucination prompts from Claude's own API docs that the community widely adopted. The idea: tell Claude it's okay to say "I don't know."
+
+Example: "Only include information you're confident about. If you're unsure, say so. When referencing facts, indicate your confidence level and suggest I verify critical claims."
+
+ADVANCED (Power User)
+7. Separate Critique from Rewrite (Two-Step Feedback) A pattern from Medium and Reddit power users: never ask Claude to critique and fix in the same message. It leads to polite rewrites instead of honest feedback. Split it into two turns.
+
+Example: Turn 1: "Critique this landing page copy ruthlessly. What's weak? What would a senior copywriter cut?" Turn 2 (after reading feedback): "Now rewrite it, applying all the critiques you just gave."
+
+8. Use Multi-Session Workflows with Fresh Context Long conversations accumulate failed attempts that poison future outputs. Reddit and Boris Cherny (creator of Claude Code) both recommend: clear the session and start fresh with a sharper prompt that includes what you learned.
+
+Example: After a 20-message debugging session that went nowhere, start a new chat: "I'm debugging a race condition in my WebSocket handler. I already tried X, Y, and Z — none worked. Here's the minimal reproduction: ... What else could cause this?"
+
+9. Have Claude Interview You Before It Builds An advanced pattern from Boris Cherny's viral workflow: instead of writing a detailed spec yourself, give Claude a minimal description and ask it to question you until it has everything it needs.
+
+Example: "I want to build a dashboard for tracking team OKRs. Before you start, interview me. Ask me questions about the users, features, tech stack, and constraints — don't build anything until you've asked at least 10 clarifying questions and I've answered them all."
