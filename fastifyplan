@@ -1,0 +1,317 @@
+# Migration Prompt: Express + routing-controllers → Fastify (function-based)
+
+> Paste this whole document to your coding agent as the task brief. It is written for an agent that has **read/write access to the repository** and can run the build and tests. Where it says "inspect," the agent must read the actual code rather than assume — the stack notes below are the starting map, not the territory.
+
+---
+
+## 1. Mission
+
+You are migrating an internal Node.js **wrapper/framework package** (a shared library other services depend on) from **Express 4 + `routing-controllers` 0.11.3 + `typedi`** to **Fastify 5, function-based**, with the explicit goal of **higher request throughput**. As part of this you will **remove the decorator-based routing/param model entirely** and replace it with plain Fastify route handlers driven by JSON Schema.
+
+This is **not** a driver swap. `routing-controllers` does not support Fastify, so its decorator/metadata layer is being deleted, not re-pointed. Treat this as a rewrite of the HTTP, validation, and middleware layers while **preserving the package's external behavior and the wire contract of every endpoint**.
+
+### Current stack (verify against the repo)
+- HTTP: `express@^4.21.2`
+- Routing/DI: `routing-controllers@0.11.3`, `typedi@0.8.0`, `reflect-metadata`, `require-all`
+- Custom decorators: `@ReqPathParam`, `@ReqQueryParam`, `@ReqHeaderParam` (and likely `@Req`, `@Res`, `@Body`, controller decorators), plus custom validators (`FutureDate`, `BetweenDates`, `PastDate`, `ValidDate`) and `WebSocketDecorators`
+- Custom middleware classes: `ContextMiddleware`, `TimeoutMiddleware`, a request/logging middleware, `NoCacheMiddleware`
+- GraphQL: `@apollo/server@4.13.0`
+- WebSockets / streaming: `ws@8.x`, plus an `SSE.ts`
+- Validation: `class-validator@^0.14.3`
+- Express middleware: `express-rate-limit`, `express-slow-down`, `express-timeout-handler`, `helmet`, `cors`, `compression`, `morgan`, `nocache`, `raw-body`
+- Observability: full OpenTelemetry stack (`@opentelemetry/sdk-node`, `auto-instrumentations-node`, metrics/resources/semantic-conventions), `elastic-apm-node`, `prom-client`
+- Utilities (framework-agnostic, keep as-is): `decimal.js`, `dayjs`, `json-bigint`, `http-status-codes`
+- TypeScript 5.5.4, `ts-node`, dual-publish concerns (see §6.13)
+
+---
+
+## 2. Non-negotiable constraints
+
+1. **Wire contract is frozen.** Every route's path, method, success status code, error status code, response body shape, and error body shape must be **byte-for-byte equivalent** post-migration unless a change is explicitly approved. Consumers depend on these. Write contract tests **before** touching a given route (see §7).
+2. **Dual CJS + ESM must be preserved.** This is a library. Do not introduce ESM-only dependencies. Match the existing `tsconfig` module target and packaging. If a needed dependency is ESM-only, stop and flag it — do not silently convert the whole package to ESM.
+3. **Performance must actually improve.** The throughput win comes from **JSON Schema response serialization**, not from the router. Every route must declare a `response` schema. A route with no response schema is an incomplete migration.
+4. **Observability must not regress.** Traces, spans, APM transactions, and Prometheus metrics that exist today must still be produced, with the same correlation/trace IDs flowing through logs.
+5. **Security posture must not regress, and must address the known Fastify validation-bypass class.** See §6.
+6. **No `@fastify/express` in the final state.** It may be used as a *temporary* bridge during incremental migration, but it reintroduces Express overhead and must be removed before completion. If you use it, track its removal as a blocking task.
+7. **Do not guess at unknowns. Flag them.** A list of things to surface rather than assume is in §9.
+
+---
+
+## 3. Operating principles
+
+- **Inspect first.** Before migrating any area, read the corresponding source files end-to-end. The decorator and middleware names above are a guide; the repo is authoritative.
+- **Preserve, then optimize.** First reach behavioral parity; only then apply Fastify-idiomatic refactors. Don't do both in the same commit.
+- **Phase by route group.** Migrate one controller/resource at a time behind contract tests. Keep the suite green at every step.
+- **Encapsulate.** Each former controller becomes a **Fastify plugin** that registers its own routes, schemas, and route-scoped hooks. Use `@fastify/autoload` to wire plugins from a directory (this replaces the `require-all` + `routing-controllers` controller globbing).
+- **One commit per concern, with the contract tests that prove parity.**
+
+---
+
+## 4. Phased plan
+
+1. **Scaffold & bootstrap.** Stand up a Fastify instance (`fastify({ logger, genReqId, ... })`), wire the global plugins (helmet, cors, compress, rate-limit), set up the error handler, and confirm the OTel/APM init ordering (§6.10). No routes yet.
+2. **Public API inventory.** Enumerate what the package exports from its entry point(s) and which of those are decorator-based (and therefore breaking). Produce the new function-based public surface and a breaking-change list for a **major version bump** (§8).
+3. **Cross-cutting layer.** Port the custom middleware classes to Fastify lifecycle hooks (§6.3), set up request context via `AsyncLocalStorage` (§6.4), logging + redaction (§6.9), and the error-shape contract (§6.8).
+4. **Validation layer.** Establish the JSON Schema / TypeBox convention and port the custom validators (§6.2).
+5. **Routes, group by group.** Convert each controller to a plugin of function handlers with full schemas (§6.1). Contract-test each before moving on.
+6. **GraphQL.** Integrate Apollo via `@as-integrations/fastify` (§6.6).
+7. **WebSockets & SSE.** Port via `@fastify/websocket` and a streaming route (§6.7).
+8. **Decommission.** Remove `routing-controllers`, `typedi` (if fully replaced), `reflect-metadata`, `require-all`, all `express*` packages, `morgan`, `nocache`, and any temporary `@fastify/express` bridge. Confirm no `import 'reflect-metadata'` or decorator metadata remains.
+9. **Verify.** Full contract suite, load/throughput comparison vs. the Express baseline, observability smoke test, dual CJS+ESM build check.
+
+---
+
+## 5. Dependency swap
+
+| Remove | Add | Notes |
+|---|---|---|
+| `express`, `routing-controllers`, `reflect-metadata`, `require-all`, param decorators | `fastify`, `@fastify/autoload` | function handlers; autoload replaces controller globbing |
+| `class-validator` | `@sinclair/typebox` + `@fastify/type-provider-typebox` (preferred) **or** `fastify-type-provider-zod` | keeps TS types + schema unified; compiles serializer for the perf win |
+| `express-rate-limit` | `@fastify/rate-limit` | onRequest hook, IP-based, Redis store option, per-route override |
+| `express-slow-down` | `rate-limiter-flexible` | already approved; gives the progressive-delay behavior `@fastify/rate-limit` does not |
+| `express-timeout-handler` | native `connectionTimeout` / route `preHandler` w/ `AbortController` | Fastify has first-class timeouts; `connect-timeout` does not work here |
+| `helmet` | `@fastify/helmet` | preserve existing CSP/header config exactly |
+| `cors` | `@fastify/cors` | preserve existing origin/credentials config |
+| `compression` | `@fastify/compress` | runs late in the lifecycle (onSend) |
+| `morgan` | **drop** → built-in Pino | structured + faster; configure to satisfy existing log expectations (§6.9) |
+| `nocache` | `@fastify/helmet` no-cache headers or an `onSend` hook | folds into helmet |
+| `@apollo/server` (keep) | `@as-integrations/fastify` | §6.6 |
+| `ws` + `WebSocketDecorators` | `@fastify/websocket` | built on `ws`; same underlying lib |
+| `raw-body` (if used for signatures) | `@fastify/raw-body` or a custom content-type parser | §6.11 — do not lose the raw buffer |
+| OTel stack, `elastic-apm-node`, `prom-client` (keep) | add `@opentelemetry/instrumentation-fastify`; optionally `fastify-metrics` | §6.10 |
+| `decimal.js`, `dayjs`, `json-bigint`, `http-status-codes` (keep) | — | framework-agnostic |
+| `typedi` | optional — drop, or keep as a standalone container | §6.4 |
+
+> Optional but recommended: `@fastify/sensible` for `httpErrors.*` helpers (§6.8) and `@fastify/under-pressure` for load shedding.
+
+Pin Fastify and all `@fastify/*` plugins to current patched releases (see §6) and keep them on the same major as `fastify`.
+
+---
+
+## 6. Detailed migration nuances
+
+### 6.1 Decorators → function handlers (the core change)
+
+Delete `routing-controllers` controllers. Each controller class becomes a **Fastify plugin** exporting route registrations. Map the param decorators to direct request access:
+
+| routing-controllers | Fastify |
+|---|---|
+| `@JsonController('/users')` + method decorators | a plugin that calls `fastify.get/post/...('/users/...', opts, handler)` |
+| `@Get('/:id')` / `@Post()` / `@Put()` / `@Delete()` | `fastify.get('/:id', ...)` etc. |
+| `@ReqPathParam('id')` / `@Param('id')` | `request.params.id` |
+| `@ReqQueryParam('q')` / `@QueryParam('q')` | `request.query.q` |
+| `@ReqHeaderParam('h')` / `@HeaderParam('h')` | `request.headers['h']` (lower-cased by Node) |
+| `@Body()` | `request.body` |
+| `@QueryParams()` / `@Params()` | the whole `request.query` / `request.params` object |
+| `@Req()` / `@Res()` | `request` / `reply` |
+| `@CurrentUser()` | `request.user`, populated by an auth `preHandler` hook (§6.4) |
+| `@UploadedFile()` / `@UploadedFiles()` | `@fastify/multipart` |
+| `@HttpCode(201)` | `reply.code(201)` or `response` schema keyed by status |
+| return value (auto-serialized) | `return value` from the async handler (Fastify serializes via the response schema) |
+| throwing `NotFoundError`, `BadRequestError`, … | throw `httpErrors.notFound()` / set `reply.code()` + throw (§6.8) |
+
+**Before/after shape:**
+```ts
+// BEFORE
+@JsonController('/users')
+export class UserController {
+  constructor(private svc: UserService) {}        // typedi injection
+  @Get('/:id')
+  @HttpCode(200)
+  async getUser(@ReqPathParam('id') id: string,
+                @ReqQueryParam('full') full: boolean) {
+    const u = await this.svc.find(id, full);
+    if (!u) throw new NotFoundError('user not found');
+    return u;
+  }
+}
+
+// AFTER — plugin, function handler, schema-driven
+import type { FastifyPluginAsync } from 'fastify';
+import { Type } from '@sinclair/typebox';
+
+export const userRoutes: FastifyPluginAsync = async (fastify) => {
+  const svc = makeUserService(/* deps */);          // see §6.4 on DI
+
+  fastify.get('/users/:id', {
+    schema: {
+      params: Type.Object({ id: Type.String() }),
+      querystring: Type.Object({ full: Type.Optional(Type.Boolean()) }),
+      response: { 200: UserSchema, 404: ErrorSchema }, // 200 schema => compiled serializer
+    },
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { full } = request.query;
+    const u = await svc.find(id, full ?? false);
+    if (!u) throw fastify.httpErrors.notFound('user not found');
+    return u;
+  });
+};
+```
+Note: validation/coercion now happens **before** the handler via the schema (e.g. `full` is coerced to boolean). Remove redundant manual parsing/validation from the handler body, but **only** once the schema reproduces the same constraints.
+
+### 6.2 Validation: `class-validator` → JSON Schema / TypeBox
+
+Each `class-validator` DTO becomes a schema. Preserve the **exact** constraints — do not loosen them. Reference mapping:
+
+| class-validator | schema |
+|---|---|
+| `@IsString()` | `type: 'string'` |
+| `@IsInt()` / `@IsNumber()` | `type: 'integer'` / `type: 'number'` |
+| `@IsBoolean()` | `type: 'boolean'` (with coercion for querystring) |
+| `@IsEmail()` | `format: 'email'` |
+| `@Min(n)` / `@Max(n)` | `minimum` / `maximum` |
+| `@Length(a,b)` / `@MinLength` / `@MaxLength` | `minLength` / `maxLength` |
+| `@IsEnum(E)` | `enum: [...]` |
+| `@IsOptional()` | omit from `required` |
+| `@ValidateNested()` + `@Type(() => X)` | nested object schema |
+| `@IsArray()` + element decorators | `type: 'array', items: {...}` |
+| custom validators (`FutureDate`, `PastDate`, `BetweenDates`, `ValidDate`) | **custom AJV keywords/formats** or TypeBox refinements; see below |
+
+**Custom validators** (`FutureDate`, etc.): register them as AJV custom keywords/formats on the Fastify AJV instance, or implement as a `preValidation`/post-parse check that throws the same error as today. Do **not** drop the semantics. If a custom validator encoded business rules (e.g. "date must be after today"), reproduce it precisely and unit-test it against the old behavior.
+
+Set AJV options to match Express behavior where it matters (`coerceTypes`, `removeAdditional`, `useDefaults`). Decide explicitly whether unknown properties were previously allowed; mirror that with `additionalProperties`.
+
+### 6.3 Middleware classes → lifecycle hooks (order matters)
+
+Express runs middleware as `(req,res,next)` in registration order. Fastify has a **typed lifecycle**: `onRequest → preParsing → preValidation → preHandler → handler → preSerialization → onSend → onResponse`. Map each middleware to the **correct stage**, not blindly to `onRequest`:
+
+| Middleware (current) | Fastify hook | Notes |
+|---|---|---|
+| `ContextMiddleware` (request context / correlation) | `onRequest` + `AsyncLocalStorage` | establish the request store early; see §6.4 |
+| auth / token validation | `preHandler` (or a route-scoped decorator) | sets `request.user` |
+| request/response logging middleware | mostly **removed** → Pino `onResponse` | Pino logs req/res automatically; keep only custom fields |
+| `TimeoutMiddleware` | route `connectionTimeout` / `preHandler` w/ `AbortController` | per-route timeouts are cleaner here |
+| `NoCacheMiddleware` | `onSend` (set `Cache-Control`) or `@fastify/helmet` | header mutation belongs in `onSend` |
+| body/raw capture | `preParsing` / content-type parser | §6.11 |
+
+Scope hooks to the plugin/route where they applied, instead of globally, to preserve "this middleware only ran for these routes" semantics. Verify the **effective order** matches the old Express chain for any route where ordering had observable effects (e.g. auth before rate-limit vs after).
+
+### 6.4 DI removal (`typedi`) + request context
+
+`routing-controllers` resolved controllers and `@CurrentUser`/services through `typedi`. Going function-based, choose per service lifetime:
+
+- **Singletons** (`@Service()` with no request state) → plain module-level singletons or factory functions. Simplest; prefer this.
+- **Request-scoped state** (correlation IDs, per-request user/tenant, anything `ContextMiddleware` stored on the request) → **`AsyncLocalStorage`**. Establish the store in an `onRequest` hook and read it anywhere downstream. This replaces typedi's request container and is the idiomatic Fastify/Node approach.
+- You **may** keep `typedi` purely as a DI container decoupled from routing if the service graph is large — but if you do, document why, and ensure it doesn't drag `reflect-metadata` decorator usage back into the routing layer.
+
+Whichever you choose, **preserve service lifetimes** — turning a request-scoped service into a singleton (or vice-versa) is a behavior change and a potential data-leak-across-requests bug. Flag any service whose scope is ambiguous.
+
+### 6.5 (reserved — see dependency table in §5)
+
+### 6.6 GraphQL: Apollo Server 4 → `@as-integrations/fastify`
+
+- Install `@as-integrations/fastify`. Construct `ApolloServer` and **include `fastifyApolloDrainPlugin(fastify)` in its `plugins`** array (required for graceful shutdown / draining).
+- `await apollo.start()` **before** registering the integration.
+- Apollo 4 moved context out of the constructor: provide a context function `(request, reply) => Promise<Context>` (typed `FastifyRequest`/`FastifyReply`). Port whatever the old context builder did (auth, loaders, tenant) into this function.
+- Register either as a plugin (`fastify.register(fastifyApollo(apollo), { context })`) on the existing GraphQL path, or via `fastifyApolloHandler` inside an explicit route. Keep the **same path and methods** as today.
+- **Subscriptions:** Apollo Server 4 does **not** handle WS subscriptions itself. If the current setup has GraphQL subscriptions, that is a separate `graphql-ws` + `@fastify/websocket` wiring — **do not assume it carries over; flag it** (§9).
+
+### 6.7 WebSockets (`ws` + decorators) and SSE
+
+- **WebSockets:** `@fastify/websocket` is built on `ws`. Replace `WebSocketDecorators` with `fastify.get('/path', { websocket: true }, (connection, request) => { ... })`. Note the connection/lifecycle API differs from raw `ws`; port handlers accordingly and preserve auth (do it in `preValidation`/`onRequest` for the upgrade route).
+- **SSE (`SSE.ts`) is not WebSockets.** It's a long-lived `text/event-stream` HTTP response. Implement as a route that writes to `reply.raw` (or use a small SSE plugin), sets the right headers, and handles client disconnect. Keep the event format and heartbeat behavior identical. Migrate SSE and WS as **separate** concerns.
+
+### 6.8 Error handling + error-shape contract
+
+- `routing-controllers` had `HttpError` subclasses and a global error handler producing a specific JSON error shape. **Capture that exact shape first** (status code + body) from the current code/tests.
+- In Fastify, set a global `setErrorHandler` (and optionally use `@fastify/sensible`'s `httpErrors`) that reproduces the same body for the same conditions. Map each old error class → equivalent thrown error.
+- **Validation errors:** Fastify's default 400 body differs from `class-validator`'s. If clients depend on the old validation-error shape, override it via `setErrorHandler` and/or `schemaErrorFormatter` to match. This is a contract item, not cosmetic.
+- Ensure thrown errors still get traced/reported to APM (§6.10).
+
+### 6.9 Logging: drop `morgan` → built-in Pino
+
+- Configure Fastify's logger (Pino). Set `genReqId` to derive from the incoming correlation header if one exists, and wire `request.id` to the OTel trace ID so logs ↔ traces correlate.
+- **Banking/PII redaction is mandatory.** Use Pino's `redact` to strip auth headers, tokens, account numbers, PANs, and any sensitive body fields from logs. Inventory what the current logging exposed and ensure the new logs are at least as redacted (preferably more).
+- Reproduce any log fields downstream systems parse (request id, latency, status, route). Remove `morgan` only after parity is confirmed.
+
+### 6.10 Observability preservation (critical ordering)
+
+- **Init order:** the OTel SDK (`@opentelemetry/sdk-node`) and instrumentations must be **started before Fastify is imported/instantiated**, or the auto-instrumentation hooks won't attach. Keep this in a tracing bootstrap loaded first (e.g. `node -r ./dist/tracing.js` or the very first import in the entry file). Verify this didn't get reordered during the migration.
+- Add `@opentelemetry/instrumentation-fastify` (it's part of `auto-instrumentations-node`, but confirm it's enabled) so Fastify routes produce spans equivalent to the old Express instrumentation.
+- `elastic-apm-node` auto-instruments Fastify; confirm transactions are named by route and errors are captured.
+- `prom-client`: keep the existing registry/metrics, or adopt `fastify-metrics` (which wraps `prom-client`) for HTTP metrics. Either way, **preserve metric names and labels** so dashboards/alerts keep working.
+
+### 6.11 Raw body / webhook signature verification (gotcha)
+
+If `raw-body` was used to verify webhook/HMAC signatures (common for payment/bank callbacks), Fastify parses JSON before your handler sees it, destroying the raw bytes. Use **`@fastify/raw-body`** (or a custom `addContentTypeParser` with `parseAs: 'buffer'`) on the specific signature-verifying routes to retain the raw buffer **alongside** the parsed body. Losing the raw body silently breaks signature checks — verify these routes explicitly.
+
+### 6.12 Routing auto-load
+
+Replace `require-all` + `routing-controllers` controller discovery with **`@fastify/autoload`** pointed at the routes/plugins directory. Preserve route prefixes (the old `routePrefix` / controller base paths) via autoload's `dirNameRoutePrefix` or explicit prefixes so URLs don't change.
+
+### 6.13 Dual CJS + ESM preservation
+
+- Keep the package's existing module system and build output. Fastify and all `@fastify/*` plugins are dual, so this is achievable.
+- In **CJS** use `require('@fastify/x')` / `fastify.register(require('@fastify/x'))`; the `await fastify.register(import('@fastify/x'))` form in some docs is ESM-only — don't mix it into a CJS build.
+- Before merging, **build and import the package both ways** (a `require()` smoke test and an `import` smoke test) to prove dual consumption still works. Do not add any ESM-only dependency without flagging it (§9).
+
+---
+
+## 6.14 Security requirements (must address, not just "don't regress")
+
+Fastify's recent **core** CVEs cluster on **content-type / schema-validation bypasses** — malformed `Content-Type` headers (casing, tab, trailing garbage, leading space) slipping past validation. Because this migration leans on schema validation for both correctness and performance, you must:
+
+1. **Pin to the latest patched Fastify** (5.8.5+ at time of writing — check for newer) and keep `@fastify/*` plugins on matching, patched versions. Add a CI check / Snyk (or `npm audit`) gate.
+2. **Do not treat schema validation as an authorization boundary.** Schemas shape input; real authz/authn checks must run independently in hooks (§6.3/§6.4) and not be bypassable by a malformed content-type.
+3. Avoid relying solely on per-content-type `schema.body.content` for security-critical validation until you've confirmed the running version patches the known bypasses.
+4. Preserve the existing `helmet`/CSP, CORS origin allow-list, and rate-limit thresholds exactly. Re-verify them post-migration.
+5. Keep `rate-limiter-flexible` configured for the brute-force/DoS protections the old `express-slow-down` provided; don't downgrade to a plain hard-limit if progressive delay was relied upon.
+
+---
+
+## 7. Testing & verification
+
+- **Contract tests first, per route.** For each endpoint, write tests asserting status code, response body, and error body **against the current Express implementation** before migrating it, then make them pass on Fastify. Use **`fastify.inject()`** (in-process, no socket) for fast route tests — it replaces supertest-style HTTP tests.
+- **Parity over snapshots:** assert the actual contract (shape, codes), not internal implementation.
+- **Validation tests:** for every ported DTO/custom validator, test that previously-rejected input is still rejected and previously-accepted input still accepted.
+- **Observability smoke test:** hit representative routes and confirm spans, APM transactions, and Prometheus metrics appear with the expected names/labels and correlated IDs.
+- **Throughput check:** benchmark a representative route (e.g. `autocannon`) on Express baseline vs Fastify to confirm the perf goal is met and that response schemas are actually compiled (a missing response schema shows up as no serialization speedup).
+- **Dual-build check:** prove both `require()` and `import` consumption (§6.13).
+- Keep the existing Jest setup; port `preprocessor.js`/config as needed.
+
+---
+
+## 8. Public API & breaking changes (it's a library)
+
+This package exposes an API other services build on. Removing the decorators is a **breaking change for consumers** that used them.
+
+1. Inventory the entry-point exports and classify each as kept / changed / removed.
+2. Design the **new function-based public surface** (the helpers/factories consumers will use instead of decorators).
+3. Produce a **breaking-change list and migration notes for consumers**, and bump the package **major version** (semver). Do not ship decorator removal as a minor/patch.
+4. If a transition window is needed, consider shipping the new API first and deprecating the old surface, but **do not** keep `routing-controllers` alive long-term — that defeats the migration.
+
+---
+
+## 9. Flag, don't guess
+
+Stop and surface (don't assume) when you hit:
+- **GraphQL subscriptions** over WebSockets — Apollo 4 doesn't carry these over; needs separate wiring.
+- Any **service whose lifetime/scope is ambiguous** (singleton vs request-scoped) — getting this wrong risks cross-request data leaks.
+- The **exact current error-body and validation-error shapes** if they aren't covered by existing tests — capture from code/QA before changing.
+- Any **ESM-only dependency** surfacing as a transitive requirement.
+- **Routes doing raw-body signature verification** — confirm before changing body parsing.
+- Any endpoint where **middleware order had observable effects** and the new hook order might differ.
+- **Custom validator business rules** that aren't obvious from the decorator name.
+- Anything where preserving the wire contract conflicts with Fastify idioms — preserve the contract and flag the tension.
+
+---
+
+## 10. Definition of done
+
+- [ ] All routes are function-based Fastify handlers; `routing-controllers`, param decorators, `reflect-metadata`, and `require-all` are removed.
+- [ ] Every route declares request **and response** schemas; serialization speedup confirmed.
+- [ ] `class-validator` removed; all DTOs + custom validators reproduced as schemas/keywords with parity tests passing.
+- [ ] Custom middleware ported to the correct lifecycle hooks; effective order verified.
+- [ ] DI replaced (plain modules + `AsyncLocalStorage`), service lifetimes preserved.
+- [ ] Apollo integrated via `@as-integrations/fastify` with drain plugin; same GraphQL path/contract.
+- [ ] WebSockets on `@fastify/websocket`; SSE ported separately; both auth-checked.
+- [ ] Error handler reproduces the exact status/body contract, including validation errors.
+- [ ] Pino logging with PII redaction; correlation IDs ↔ traces; `morgan` removed.
+- [ ] OTel/APM/prom-client preserved with same names/labels; init ordering verified.
+- [ ] Raw-body signature routes verified intact.
+- [ ] All `express*` packages, `morgan`, `nocache`, and any temporary `@fastify/express` bridge removed.
+- [ ] Fastify + plugins pinned to patched versions; audit/Snyk gate green; §6.14 items addressed.
+- [ ] Dual CJS + ESM consumption proven.
+- [ ] Contract suite green; throughput improved vs baseline; observability smoke test passes.
+- [ ] Public API breaking changes documented; major version bumped; consumer migration notes written.
