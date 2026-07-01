@@ -1,0 +1,326 @@
+# Migration Prompt: Express + routing-controllers → Hono (function-based)
+
+> Paste this whole document to your coding agent as the task brief. It is written for an agent that has **read/write access to the repository** and can run the build and tests. Where it says "inspect," the agent must read the actual code rather than assume — the stack notes below are the starting map, not the territory.
+
+---
+
+## 1. Mission
+
+You are migrating an internal Node.js **wrapper/framework package** (a shared library other services depend on) from **Express 4 + `routing-controllers` 0.11.3 + `typedi`** to **Hono 4.x, function-based, running on Node.js via `@hono/node-server`**, with the explicit goal of **higher request throughput and a lighter dependency footprint**. As part of this you will **remove the decorator-based routing/param/DI model entirely** and replace it with plain Hono route handlers and middleware. There is **no dependency-injection container in the target state** — request-scoped state moves to `AsyncLocalStorage`, and everything else becomes plain modules/factories.
+
+This is **not** a driver swap. `routing-controllers` does not support Hono, so its decorator/metadata layer is being deleted, not re-pointed. Treat this as a rewrite of the HTTP, validation, and middleware layers while **preserving the package's external behavior and the wire contract of every endpoint**.
+
+### Current stack (verify against the repo)
+- HTTP: `express@^4.21.2`
+- Routing/DI: `routing-controllers@0.11.3`, `typedi@0.8.0`, `reflect-metadata`, `require-all`
+- Custom decorators: `@ReqPathParam`, `@ReqQueryParam`, `@ReqHeaderParam` (and likely `@Req`, `@Res`, `@Body`, controller decorators), plus custom validators (`FutureDate`, `BetweenDates`, `PastDate`, `ValidDate`) and `WebSocketDecorators`
+- Custom middleware classes: `ContextMiddleware`, `TimeoutMiddleware`, a request/logging middleware, `NoCacheMiddleware`
+- GraphQL: `@apollo/server@4.13.0` — **note: Apollo Server 4 is EOL as of Jan 2026; this migration is also an implicit upgrade to Apollo Server 5**, which requires Node ≥20.0.0
+- WebSockets / streaming: `ws@8.x`, plus an `SSE.ts`
+- Validation: `class-validator@^0.14.3`
+- Express middleware: `express-rate-limit`, `express-slow-down`, `express-timeout-handler`, `helmet`, `cors`, `compression`, `morgan`, `nocache`, `raw-body`
+- Observability: full OpenTelemetry stack (`@opentelemetry/sdk-node`, `auto-instrumentations-node`, metrics/resources/semantic-conventions), `elastic-apm-node`, `prom-client`
+- Utilities (framework-agnostic, keep as-is): `decimal.js`, `dayjs`, `json-bigint`, `http-status-codes`
+- TypeScript 5.5.4, `ts-node`, dual-publish concerns (see §6.13)
+
+---
+
+## 2. Non-negotiable constraints
+
+1. **Wire contract is frozen.** Every route's path, method, success status code, error status code, response body shape, and error body shape must be **byte-for-byte equivalent** post-migration unless a change is explicitly approved. Consumers depend on these. Write contract tests **before** touching a given route (see §7).
+2. **Dual CJS + ESM must be preserved, with one explicit accommodation.** Hono's core package is shipped **ESM-only** by upstream design — there is no CJS build to fall back to. To keep this a dual-published library, the package's **minimum supported Node version must be raised to `>=20.19.0`** (or standardize on `>=22.12.0`), which is the version floor where Node's `require()` can synchronously load an ESM dependency (`require(esm)`). This is a deliberate, scoped exception to "no ESM-only deps" — document it clearly in the changelog and confirm it in the dual-build check (§6.13). Do not introduce any *other* ESM-only dependency without flagging it.
+3. **Performance must actually improve**, but the lever is different from a schema-compiling framework: Hono has no `fast-json-stringify`-equivalent compiled response serializer. The throughput case here rests on Hono's router and dispatch overhead being lower, and on trimming the `routing-controllers`/`typedi` reflection/decorator overhead entirely. Benchmark against the Express baseline (§7); don't assume the win without measuring it.
+4. **Observability must not regress.** Traces, spans, APM transactions, and Prometheus metrics that exist today must still be produced, with the same correlation/trace IDs flowing through logs. Note: there is **no first-party OTel auto-instrumentation package for Hono** — this needs a manual-span or `instrumentation-http`-level solution (§6.10). Flag risk to route-level span naming and treat it as a verification item, not an assumption.
+5. **Security posture must not regress.** Preserve existing CORS/CSP/rate-limit configuration exactly; see §6.14.
+6. **No bridging framework in the final state.** There is no Hono equivalent of `@fastify/express` to lean on — this is a clean cut, not an incremental shim. Plan the phased rollout (§4/§9) around that reality.
+7. **Do not guess at unknowns. Flag them.** A list of things to surface rather than assume is in §9.
+
+---
+
+## 3. Operating principles
+
+- **Inspect first.** Before migrating any area, read the corresponding source files end-to-end. The decorator and middleware names above are a guide; the repo is authoritative.
+- **Preserve, then optimize.** First reach behavioral parity; only then apply Hono-idiomatic refactors. Don't do both in the same commit.
+- **Phase by route group.** Migrate one controller/resource at a time behind contract tests. Keep the suite green at every step.
+- **Compose, don't autoload.** Hono has no autoload/globbing plugin equivalent to `@fastify/autoload` or `require-all`. Each former controller becomes a module exporting a `Hono` sub-app or route-registration function, and a top-level file explicitly composes them with `app.route(prefix, subApp)`. Keep this composition file as the single source of truth for the route tree — resist the temptation to re-invent auto-discovery.
+- **One commit per concern, with the contract tests that prove parity.**
+
+---
+
+## 4. Phased plan
+
+1. **Scaffold & bootstrap.** Stand up a `Hono` instance served via `@hono/node-server`'s `serve()`, wire the global middleware (`hono/secure-headers`, `hono/cors`, `hono/compress`, rate limiting), set up the error handler (`app.onError`), and confirm the OTel/APM init ordering (§6.10). No routes yet. Bump `engines.node` in `package.json` per §2.2.
+2. **Public API inventory.** Enumerate what the package exports from its entry point(s) and which of those are decorator-based (and therefore breaking). Produce the new function-based public surface and a breaking-change list for a **major version bump** (§8).
+3. **Cross-cutting layer.** Port the custom middleware classes to Hono middleware functions (§6.3), set up request context via `AsyncLocalStorage` (§6.4), logging + redaction (§6.9), and the error-shape contract (§6.8).
+4. **Validation layer.** Settle the schema library (TypeBox or Zod — this is an **open decision**, not preset; see §9) and port the custom validators (§6.2).
+5. **Routes, group by group.** Convert each controller to a module of function handlers with full request/response validation (§6.1). Contract-test each before moving on.
+6. **GraphQL.** Integrate Apollo Server 5 via the community `apollo-server-integration-hono` package (§6.6).
+7. **WebSockets & SSE.** Port via `@hono/node-ws` and a streaming route (§6.7).
+8. **Decommission.** Remove `routing-controllers`, `typedi`, `reflect-metadata`, `require-all`, all `express*` packages, `morgan`, `nocache`. Confirm no `import 'reflect-metadata'` or decorator metadata remains anywhere in the codebase.
+9. **Verify.** Full contract suite, load/throughput comparison vs. the Express baseline, observability smoke test, dual CJS+ESM build check on the new Node floor.
+
+---
+
+## 5. Dependency swap
+
+| Remove | Add | Notes |
+|---|---|---|
+| `express`, `routing-controllers`, `reflect-metadata`, `require-all`, param decorators | `hono`, `@hono/node-server` | function handlers; manual `app.route()` composition replaces controller globbing |
+| `class-validator` | `@sinclair/typebox` **or** `zod` + `@hono/zod-validator` (or equivalent Standard-Schema validator middleware) | **choice not yet made** — flag for decision, don't default silently |
+| `express-rate-limit` | `hono-rate-limiter` (community; no first-party `@hono/rate-limiter` exists as of this migration) | verify maintenance/CVE posture before adopting — it's a third-party trust boundary either way |
+| `express-slow-down` | `rate-limiter-flexible`, wired in by hand as Hono middleware | already approved in prior planning; gives the progressive-delay behavior neither Hono nor the rate-limit package provides out of the box |
+| `express-timeout-handler` | `hono/timeout` (built-in middleware) or a route-scoped `AbortController` | first-party, no extra install |
+| `helmet` | `hono/secure-headers` (built-in) | preserve existing CSP/header config exactly; option names differ from `helmet`'s — map field-by-field, don't assume 1:1 |
+| `cors` | `hono/cors` (built-in) | preserve existing origin/credentials config |
+| `compression` | `hono/compress` (built-in) | confirm Node adapter support and streaming interaction |
+| `morgan` | **drop** → `hono/logger` (built-in) or continue with Pino manually | reproduce required log fields (§6.9) |
+| `nocache` | manual `Cache-Control` header set in middleware, or fold into `hono/secure-headers` | no direct package equivalent |
+| `@apollo/server@4.13.0` | `@apollo/server@^5` + `apollo-server-integration-hono` | Apollo 4→5 upgrade is forced (EOL); integration package is community-maintained, not first-party — §6.6 |
+| `ws` + `WebSocketDecorators` | `@hono/node-ws` | official Node adapter, built on `ws` — same underlying library |
+| `raw-body` (if used for signatures) | `Buffer`-mode content parsing on signature routes (read `c.req.raw.body` / use a raw content-type handler) | §6.11 — do not lose the raw bytes |
+| OTel stack, `elastic-apm-node`, `prom-client` (keep) | **no Hono-specific OTel instrumentation package exists** — instrument manually via middleware spans, relying on `instrumentation-http` at the underlying Node server level | §6.10 — treat as a verification risk, not a solved problem |
+| `decimal.js`, `dayjs`, `json-bigint`, `http-status-codes` (keep) | — | framework-agnostic |
+| `typedi` | **drop entirely** | plain modules + factories; request-scoped state via `AsyncLocalStorage` (§6.4) — this is settled, not optional, for this migration |
+
+Pin `hono`, `@hono/node-server`, `@hono/node-ws`, and any community middleware to specific patched versions and gate with `npm audit`/Snyk (§6.14).
+
+---
+
+## 6. Detailed migration nuances
+
+### 6.1 Decorators → function handlers (the core change)
+
+Delete `routing-controllers` controllers. Each controller class becomes a **module exporting a `Hono` sub-app** (or a function that registers routes on a passed-in app). Map the param decorators to direct request access:
+
+| routing-controllers | Hono |
+|---|---|
+| `@JsonController('/users')` + method decorators | a `new Hono()` sub-app mounted at `/users` via `app.route('/users', userRoutes)` |
+| `@Get('/:id')` / `@Post()` / `@Put()` / `@Delete()` | `userRoutes.get('/:id', ...)` etc. |
+| `@ReqPathParam('id')` / `@Param('id')` | `c.req.param('id')` |
+| `@ReqQueryParam('q')` / `@QueryParam('q')` | `c.req.query('q')` |
+| `@ReqHeaderParam('h')` / `@HeaderParam('h')` | `c.req.header('h')` |
+| `@Body()` | `await c.req.json()` (or the parsed body from a validator middleware) |
+| `@QueryParams()` / `@Params()` | `c.req.query()` / `c.req.param()` with no key (whole object) |
+| `@Req()` / `@Res()` | `c.req` / `c` (Hono's context wraps both request and response) |
+| `@CurrentUser()` | a value set on context by an auth middleware, read via `c.get('user')` (Hono's typed context store, or `AsyncLocalStorage`) |
+| `@UploadedFile()` / `@UploadedFiles()` | `hono/body-limit` + manual `c.req.parseBody()` for multipart |
+| `@HttpCode(201)` | `c.json(body, 201)` |
+| return value (auto-serialized) | explicit `return c.json(value)` — **Hono does not auto-serialize a returned plain object the way Fastify/`routing-controllers` did; every handler must call `c.json()`/`c.text()`/etc. explicitly** |
+| throwing `NotFoundError`, `BadRequestError`, … | `throw new HTTPException(404, { message: 'user not found' })` from `hono/http-exception` (§6.8) |
+
+**Before/after shape:**
+```ts
+// BEFORE
+@JsonController('/users')
+export class UserController {
+  constructor(private svc: UserService) {}        // typedi injection
+  @Get('/:id')
+  @HttpCode(200)
+  async getUser(@ReqPathParam('id') id: string,
+                @ReqQueryParam('full') full: boolean) {
+    const u = await this.svc.find(id, full);
+    if (!u) throw new NotFoundError('user not found');
+    return u;
+  }
+}
+
+// AFTER — sub-app module, function handler, validator middleware
+import { Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception';
+import { zValidator } from '@hono/zod-validator';
+import { z } from 'zod';
+import { makeUserService } from './user-service';
+
+const paramsSchema = z.object({ id: z.string() });
+const querySchema = z.object({ full: z.coerce.boolean().optional() });
+
+export const userRoutes = new Hono();
+const svc = makeUserService(/* deps */);
+
+userRoutes.get(
+  '/:id',
+  zValidator('param', paramsSchema),
+  zValidator('query', querySchema),
+  async (c) => {
+    const { id } = c.req.valid('param');
+    const { full } = c.req.valid('query');
+    const u = await svc.find(id, full ?? false);
+    if (!u) throw new HTTPException(404, { message: 'user not found' });
+    return c.json(u, 200);
+  }
+);
+
+// top-level composition file
+app.route('/users', userRoutes);
+```
+Note: unlike the Fastify/`fast-json-stringify` model, there is **no automatic response serialization from a schema** — the `response` validation (if you choose to validate outgoing bodies at all) is a separate, optional concern from what actually gets sent. Don't assume a "response schema" buys you a performance win here the way it did in the Fastify plan; it buys you a contract check, which is still valuable but is a different claim.
+
+### 6.2 Validation: `class-validator` → TypeBox/Zod (library choice open)
+
+This decision was **explicitly left open** in prior planning and still needs to be made before §4 step 4 starts. Whichever is chosen, preserve constraints exactly:
+
+| class-validator | Zod (if chosen) | TypeBox (if chosen) |
+|---|---|---|
+| `@IsString()` | `z.string()` | `Type.String()` |
+| `@IsInt()` / `@IsNumber()` | `z.number().int()` / `z.number()` | `Type.Integer()` / `Type.Number()` |
+| `@IsBoolean()` | `z.coerce.boolean()` (querystring) | `Type.Boolean()` + coercion |
+| `@IsEmail()` | `z.string().email()` | `Type.String({ format: 'email' })` |
+| `@Min(n)` / `@Max(n)` | `.min(n)` / `.max(n)` | `minimum` / `maximum` |
+| `@Length(a,b)` / `@MinLength` / `@MaxLength` | `.min()` / `.max()` on string | `minLength` / `maxLength` |
+| `@IsEnum(E)` | `z.nativeEnum(E)` | `Type.Enum(E)` |
+| `@IsOptional()` | `.optional()` | `Type.Optional(...)` |
+| `@ValidateNested()` + `@Type(() => X)` | nested `z.object({...})` | nested `Type.Object({...})` |
+| `@IsArray()` + element decorators | `z.array(itemSchema)` | `Type.Array(itemSchema)` |
+| custom validators (`FutureDate`, `PastDate`, `BetweenDates`, `ValidDate`) | `.refine()` / `.superRefine()` | custom TypeBox `Kind` + AJV keyword, or a wrapping refinement |
+
+**Custom validators**: reproduce the exact semantics as refinements/custom keywords, not loosened approximations. If a validator encoded a business rule (e.g. "date must be after today"), unit-test it against the old behavior before considering it ported.
+
+Whichever library is chosen, wire it through `@hono/zod-validator` (Zod) or an equivalent TypeBox validator middleware so `c.req.valid(...)` is available in handlers — do not hand-roll ad hoc validation per route.
+
+### 6.3 Middleware classes → Hono middleware functions
+
+Express and Hono both use an `(c, next) => ...` / `async (c, next) => { ...; await next(); ... }` style — this is a **much smaller conceptual jump** than the Fastify staged-lifecycle model was. There's no `onRequest`/`preParsing`/`preHandler` distinction; ordering is purely registration order plus before/after-`next()` placement:
+
+| Middleware (current) | Hono equivalent | Notes |
+|---|---|---|
+| `ContextMiddleware` (request context / correlation) | a middleware that opens an `AsyncLocalStorage` run() before calling `next()` | establish the store as early as possible in the chain; see §6.4 |
+| auth / token validation | a middleware that sets `c.set('user', ...)` before `next()` | scope to the routes/sub-apps that need it, not globally, if the old middleware wasn't global |
+| request/response logging middleware | mostly **removed** → `hono/logger`, or a thin wrapper that logs after `await next()` | keep only fields the built-in logger doesn't cover |
+| `TimeoutMiddleware` | `hono/timeout` built-in, or a custom `AbortController`-based wrapper | confirm behavior on already-streaming responses (SSE/WS) — timeout middleware should generally exclude those routes |
+| `NoCacheMiddleware` | a middleware that sets `Cache-Control` headers on `c.res` after `await next()` | equivalent to Express's response-header mutation pattern |
+| body/raw capture | a custom body-reading step before validation, on signature-verifying routes only | §6.11 |
+
+Since Hono's model is closer to Express's than Fastify's staged lifecycle was, **pay extra attention to before-`next()` vs after-`next()` placement** — it's easy to accidentally collapse two middlewares that had distinct "before" and "after" responsibilities in the old chain into one that only does one or the other. Verify effective order matches the old Express chain for any route where ordering had observable effects (e.g. auth before rate-limit vs after).
+
+### 6.4 DI removal (`typedi`) + request context — settled, not optional
+
+Unlike the earlier Fastify-era planning (which left "keep typedi as a standalone container" open), this migration **removes `typedi` entirely**. There is no DI container in the target state.
+
+- **Singletons** (`@Service()` with no request state) → plain module-level singletons or factory functions, instantiated once at bootstrap and imported where needed.
+- **Request-scoped state** (correlation IDs, per-request user/tenant, anything `ContextMiddleware` stored on the request) → **`AsyncLocalStorage`**, established in the earliest middleware in the chain (§6.3) and read anywhere downstream via a small accessor module (e.g. `getRequestContext()`).
+- Hono's own `c.set()`/`c.get()` typed context store can hold *handler-local* values scoped to the current request's middleware chain, but it does not propagate into code called outside the Hono context object (e.g. deep service-layer functions) the way `AsyncLocalStorage` does — use `AsyncLocalStorage` for anything that needs to reach code that doesn't have `c` in scope, and `c.set()`/`c.get()` for things read only within handlers/middleware.
+- **Preserve service lifetimes** — turning a request-scoped service into a singleton (or vice versa) is a behavior change and a potential cross-request data leak. Flag any service whose scope is ambiguous rather than guessing (§9).
+
+### 6.5 (reserved)
+
+### 6.6 GraphQL: Apollo Server 4 → Apollo Server 5 via `apollo-server-integration-hono`
+
+- This is a **forced two-part change**: Apollo Server 4 is end-of-life (Jan 2026), so the upgrade to Apollo Server 5 (Node ≥20.0.0 — already satisfied by §2.2's floor) needs to happen regardless of the framework migration. Do it as a distinct, tracked step so an Apollo-version regression isn't conflated with a Hono-integration bug.
+- Install `apollo-server-integration-hono` — **this is a community-maintained package, not an official Apollo or Hono integration.** Before adopting it: check its maintenance activity, open issues, and whether it tracks current Apollo Server 5 minor releases. If it looks under-maintained, flag this as a risk rather than silently proceeding (§9).
+- Construct `ApolloServer` as usual and use the package's `startServerAndCreateHonoHandler(server, { context })` to produce a Hono-compatible handler, mounted at the existing GraphQL path.
+- `await apollo.start()` before wiring the handler, same as before.
+- Context: provide a context function shaped for Hono's context object (check the integration package's exact signature — it typically receives the Hono `Context` rather than raw `request`/`reply`). Port whatever the old context builder did (auth, loaders, tenant) into this function.
+- **Subscriptions:** as before, Apollo Server does **not** handle WS subscriptions itself. If the current setup has GraphQL subscriptions, that's separate `graphql-ws` + `@hono/node-ws` wiring — **do not assume it carries over; flag it** (§9).
+
+### 6.7 WebSockets (`ws` + decorators) and SSE
+
+- **WebSockets:** `@hono/node-ws`'s `createNodeWebSocket({ app })` returns `{ injectWebSocket, upgradeWebSocket }`. Replace `WebSocketDecorators` with `app.get('/path', upgradeWebSocket((c) => ({ onMessage, onClose, onOpen, ... })))`, and call `injectWebSocket(server)` on the `@hono/node-server`-returned server instance after `serve()`. Note the connection/lifecycle API (`onOpen`/`onMessage`/`onClose`) differs from raw `ws`; port handlers accordingly and preserve auth by validating **before** the upgrade (in middleware ahead of the `upgradeWebSocket` route), since headers can become immutable once the upgrade helper runs.
+- **SSE (`SSE.ts`) is not WebSockets.** It's a long-lived `text/event-stream` HTTP response. Use `hono/streaming`'s `streamSSE(c, async (stream) => { ... })` helper, which handles the headers and write loop. Keep the event format and heartbeat behavior identical. Migrate SSE and WS as **separate** concerns.
+- If both CORS/secure-headers middleware and the WebSocket upgrade route interact on the same path, test explicitly — Hono's own docs flag header-mutation conflicts between middleware and `upgradeWebSocket()`.
+
+### 6.8 Error handling + error-shape contract
+
+- `routing-controllers` had `HttpError` subclasses and a global error handler producing a specific JSON error shape. **Capture that exact shape first** (status code + body) from the current code/tests.
+- In Hono, set `app.onError((err, c) => { ... })` to reproduce the same body for the same conditions. Map each old error class → a thrown `HTTPException` (from `hono/http-exception`) or a custom error class caught in `onError`.
+- **Validation errors:** whatever validator middleware you choose (Zod/TypeBox) has its own default error shape on failure — override its error handler (`zValidator`'s optional hook argument, or the TypeBox validator's equivalent) so it matches `class-validator`'s old body exactly. This is a contract item, not cosmetic.
+- Ensure thrown errors still get traced/reported to APM (§6.10) — confirm the APM agent's Node/HTTP-level instrumentation still captures unhandled and `onError`-caught exceptions the way Express-level middleware errors used to.
+
+### 6.9 Logging: drop `morgan` → `hono/logger` or Pino
+
+- `hono/logger` is a minimal built-in request logger; it likely won't match the field set the old `morgan`+custom middleware produced. Decide between the built-in logger (simpler, fewer fields) and continuing with Pino wired in as custom middleware (more control, matches the observability stack's existing use of structured logging elsewhere).
+- Set request-id generation so it derives from the incoming correlation header if one exists, and wire it to the OTel trace ID so logs ↔ traces correlate — same requirement as before, framework-independent.
+- **Banking/PII redaction is mandatory.** If using Pino, keep its `redact` config; if using `hono/logger`, you likely need a wrapping layer since it doesn't have built-in redaction. Inventory what the current logging exposed (auth headers, tokens, account numbers, PANs, sensitive body fields) and ensure the new logs are at least as redacted.
+- Reproduce any log fields downstream systems parse (request id, latency, status, route). Remove `morgan` only after parity is confirmed.
+
+### 6.10 Observability preservation (higher-risk area than the Fastify plan)
+
+- **Init order:** the OTel SDK (`@opentelemetry/sdk-node`) and instrumentations must still be **started before the app/server code is imported/instantiated**, or auto-instrumentation hooks won't attach. Keep this in a tracing bootstrap loaded first. Verify this didn't get reordered during the migration.
+- **There is no `@opentelemetry/instrumentation-hono` equivalent to what Fastify had.** `auto-instrumentations-node`'s `instrumentation-http` will still instrument the underlying Node `http`/`http2` server that `@hono/node-server` runs on, which gets you request-level spans — but route-level naming/attribution (e.g. `GET /users/:id` rather than the raw path) is **not automatic** the way `instrumentation-fastify` provided it. Plan to add a thin middleware that reads the matched route pattern (Hono exposes this on the context) and sets it as a span attribute/name, and treat this as a build-and-verify task, not an assumption.
+- `elastic-apm-node`'s auto-instrumentation for Express/Fastify won't apply the same way to Hono; confirm empirically whether transactions are still named usefully by route, and add manual transaction naming if not.
+- `prom-client`: keep the existing registry/metrics; there's no `fastify-metrics`-style wrapper for Hono, so HTTP metrics (request counts, latency histograms by route/status) need a small custom middleware that increments/observes on `onResponse`-equivalent (i.e., after `await next()`). **Preserve metric names and labels** so dashboards/alerts keep working.
+
+### 6.11 Raw body / webhook signature verification (gotcha — unchanged in spirit)
+
+If `raw-body` was used to verify webhook/HMAC signatures (common for payment/bank callbacks), any JSON-parsing step before your handler destroys the raw bytes needed for signature verification. On signature-verifying routes specifically, read the body as a raw buffer/text (`await c.req.arrayBuffer()` or `.text()`) **before** any JSON-parsing validator middleware runs, verify the signature against those raw bytes, and only then parse. Losing the raw body silently breaks signature checks — verify these routes explicitly and don't let a global JSON-parsing validator run ahead of the raw read on them.
+
+### 6.12 Routing composition (no autoload)
+
+There is no `@fastify/autoload`/`require-all` equivalent. Build an explicit composition root: each former controller's module exports a `Hono` sub-app; a single top-level file `app.route(prefix, subApp)`s all of them together. Preserve the old route prefixes (the former `routePrefix` / controller base paths) exactly in this composition file so URLs don't change. Treat this file as the canonical route map going forward — it's less "magic" than the old globbing setup, which is a net positive for auditability, but it means every new route module must be remembered and wired in explicitly (add a lint/test check that fails if a routes file exists but isn't mounted).
+
+### 6.13 Dual CJS + ESM preservation (the accommodation from §2.2)
+
+- Because Hono core ships ESM-only, the package's **CJS build's internal use of `hono`/`@hono/node-server`/`@hono/node-ws` will rely on Node's synchronous `require(esm)` support**, available from Node `20.19.0`/`22.12.0` onward. Raise `engines.node` accordingly and document this explicitly in the migration/changelog notes — this is a real, if narrow, floor-raise for consumers, not a cosmetic version bump.
+- Confirm none of Hono's dependency graph relies on **top-level await** anywhere reachable from your import path — `require(esm)` only works when the ESM graph can resolve synchronously; a top-level `await` anywhere in that graph breaks it and forces you back to dynamic `import()` (async) in the CJS entry, which is a bigger consumer-facing change. Verify this rather than assuming it.
+- Keep the rest of the package's existing dual CJS+ESM build setup (the `exports` map, `main`/`module` fields) as-is; only the Node floor changes.
+- Before merging, **build and import the package both ways** on the new minimum Node version — a `require()` smoke test and an `import` smoke test — to prove dual consumption still works. Do not add any *additional* ESM-only dependency beyond Hono's own ecosystem without flagging it (§9).
+
+---
+
+## 6.14 Security requirements
+
+1. **Pin `hono`, `@hono/node-server`, `@hono/node-ws`, and any community middleware (`hono-rate-limiter`, `apollo-server-integration-hono`) to specific, current-patched versions** and gate with `npm audit`/Snyk in CI. Because several of these are community-maintained rather than first-party, treat version pinning and audit gating as more load-bearing here than they were in a Fastify-first-party-plugin world.
+2. **Do not treat request validation as an authorization boundary.** Schema/validator middleware shapes input; real authn/authz checks must run independently in middleware and must not be bypassable by malformed input that slips past a validator's edge cases.
+3. Preserve the existing `helmet`/CSP config, CORS origin allow-list, and rate-limit thresholds **exactly** when translating to `hono/secure-headers`, `hono/cors`, and the chosen rate-limiter — field names and defaults differ between libraries, so map option-by-option rather than assuming equivalence, and re-verify post-migration (e.g. actually inspect response headers, don't just assume the config "looks right").
+4. Keep `rate-limiter-flexible` configured for the brute-force/DoS protections the old `express-slow-down` provided; don't downgrade to a plain hard-limit if progressive delay was relied upon.
+5. Since the CJS build now depends on `require(esm)` behavior (§6.13), treat any future Node engine downgrade request from a consumer as a security/compatibility conversation, not a routine support-matrix tweak — it could silently break the library for them.
+
+---
+
+## 7. Testing & verification
+
+- **Contract tests first, per route.** For each endpoint, write tests asserting status code, response body, and error body **against the current Express implementation** before migrating it, then make them pass on Hono. Use Hono's app instance directly with a test client (e.g. calling `app.request(...)`, which runs in-process without a real socket) for fast route tests.
+- **Parity over snapshots:** assert the actual contract (shape, codes), not internal implementation.
+- **Validation tests:** for every ported DTO/custom validator, test that previously-rejected input is still rejected and previously-accepted input still accepted.
+- **Observability smoke test:** hit representative routes and confirm spans, APM transactions, and Prometheus metrics appear with the expected names/labels and correlated IDs — this needs more scrutiny than in the Fastify plan given §6.10's gaps.
+- **Throughput check:** benchmark a representative route (e.g. `autocannon`) on the Express baseline vs. Hono to confirm the perf goal is actually met — don't assume it the way a schema-serialization framework would let you.
+- **Dual-build check:** prove both `require()` and `import` consumption on the new Node floor (§6.13), including a check that the ESM graph resolves synchronously.
+- Keep the existing Jest setup; port `preprocessor.js`/config as needed.
+
+---
+
+## 8. Public API & breaking changes (it's a library)
+
+This package exposes an API other services build on. Removing the decorators **and** raising the Node engine floor are both breaking changes for consumers.
+
+1. Inventory the entry-point exports and classify each as kept / changed / removed.
+2. Design the **new function-based public surface** (the helpers/factories consumers will use instead of decorators).
+3. Produce a **breaking-change list and migration notes for consumers** covering both the API shape change and the Node version floor raise, and bump the package **major version** (semver). Do not ship either change as a minor/patch.
+4. If a transition window is needed, consider shipping the new API first and deprecating the old surface, but given there's no bridging framework available here (§2.6), a long dual-maintenance window is more expensive than it was in the Fastify plan — weigh incremental vs. big-bang rollout explicitly rather than defaulting to incremental (§9).
+
+---
+
+## 9. Flag, don't guess
+
+Stop and surface (don't assume) when you hit:
+- **The validation library choice (TypeBox vs. Zod)** — this was left open; confirm before building out §6.2 broadly.
+- **GraphQL subscriptions** over WebSockets — Apollo Server doesn't carry these over; needs separate `graphql-ws` + `@hono/node-ws` wiring.
+- The **maintenance health of community packages** you're now depending on (`apollo-server-integration-hono`, `hono-rate-limiter`) — if either looks stale or has open security issues, surface it before building on top of it.
+- Any **service whose lifetime/scope is ambiguous** (singleton vs. request-scoped) — getting this wrong risks cross-request data leaks.
+- The **exact current error-body and validation-error shapes** if they aren't covered by existing tests — capture from code/QA before changing.
+- Whether Hono's/`hono`'s dependency graph resolves synchronously for `require(esm)` purposes, or whether a top-level await forces an async CJS entry (§6.13).
+- **Routes doing raw-body signature verification** — confirm before changing body parsing.
+- Any endpoint where **middleware order had observable effects** and the new before/after-`next()` placement might differ (§6.3).
+- **Custom validator business rules** that aren't obvious from the decorator name.
+- Whether **observability route-naming** (§6.10) is acceptable without a Hono-specific instrumentation package, or whether that's a blocking gap for your dashboards/alerts.
+- **Incremental vs. big-bang rollout** — given there's no bridge framework, this needs an explicit decision rather than defaulting to incremental.
+- Anything where preserving the wire contract conflicts with Hono idioms — preserve the contract and flag the tension.
+
+---
+
+## 10. Definition of done
+
+- [ ] All routes are function-based Hono handlers, composed via explicit `app.route()` calls; `routing-controllers`, param decorators, `reflect-metadata`, `require-all`, and `typedi` are removed.
+- [ ] Validation library (TypeBox or Zod) chosen and applied consistently; `class-validator` removed; all DTOs + custom validators reproduced with parity tests passing.
+- [ ] Custom middleware ported to Hono middleware functions with verified before/after-`next()` placement matching old ordering semantics.
+- [ ] DI removed entirely; request-scoped state on `AsyncLocalStorage`; service lifetimes preserved.
+- [ ] Apollo Server upgraded to v5 and integrated via `apollo-server-integration-hono`; same GraphQL path/contract; integration package's maintenance status checked.
+- [ ] WebSockets on `@hono/node-ws`; SSE ported separately via `hono/streaming`; both auth-checked pre-upgrade.
+- [ ] Error handler (`app.onError` + validator-specific error hooks) reproduces the exact status/body contract, including validation errors.
+- [ ] Logging strategy (built-in `hono/logger` vs. Pino) decided and implemented with PII redaction; correlation IDs ↔ traces; `morgan` removed.
+- [ ] OTel/APM/prom-client preserved with same metric names/labels; route-level span naming solved manually and verified; init ordering verified.
+- [ ] Raw-body signature routes verified intact.
+- [ ] All `express*` packages, `morgan`, `nocache` removed.
+- [ ] `hono`, `@hono/node-server`, `@hono/node-ws`, and community middleware pinned to patched versions; audit/Snyk gate green; §6.14 items addressed.
+- [ ] `engines.node` raised to `>=20.19.0` (or `22.12.0`); dual CJS + ESM consumption proven on that floor, including a synchronous-resolution check for `require(esm)`.
+- [ ] Contract suite green; throughput measured (not assumed) vs. baseline; observability smoke test passes.
+- [ ] Public API breaking changes **and** the Node engine floor raise documented; major version bumped; consumer migration notes written.
