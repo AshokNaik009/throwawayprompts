@@ -1,0 +1,419 @@
+# Migration Prompt: Express + routing-controllers → Fastify (two-stage, function-based)
+
+> Paste this whole document to your coding agent as the task brief. It is written for an agent that has **read/write access to the repository** and can run the build and tests. Where it says "inspect," the agent must read the actual code rather than assume — the stack notes below are the starting map, not the territory.
+
+> **What changed from the previous version of this brief:** the migration is now explicitly **two stages**. Stage 0 removes `routing-controllers` and `typedi` **while staying on Express** — you reach function-based, decorator-free parity behind the frozen wire contract *before* the HTTP layer changes. Stage 1 is the Express→Fastify swap (the plan you already had), now starting from clean function handlers. This decouples two independent hard changes so neither hides the other's regressions.
+
+---
+
+## 1. Mission
+
+You are migrating an internal Node.js **wrapper/framework package** (a shared library other services depend on) from **Express 4 + `routing-controllers` 0.11.3 + `typedi`** to **Fastify 5, function-based**, with the explicit goal of **higher request throughput**. You will do it in two stages:
+
+- **Stage 0 — De-decorate on Express (same framework).** Delete the decorator-based routing/param/DI model entirely and replace it with plain Express routers, function handlers, module-level services, and `AsyncLocalStorage` request context. **You stay on Express.** `class-validator`, `reflect-metadata`, and `express` all remain. The goal of this stage is a decorator-free, function-based package that passes the full contract suite unchanged.
+- **Stage 1 — Swap Express → Fastify.** Replace the HTTP, validation-schema, serialization, and middleware layers with Fastify 5 as previously planned, now starting from function handlers rather than decorators.
+
+This is **not** a driver swap. `routing-controllers` does not support Fastify, so its decorator/metadata layer is being deleted, not re-pointed — and in this plan it is deleted in Stage 0, before Fastify is introduced. Treat both stages as rewrites of the HTTP/validation/middleware layers while **preserving the package's external behavior and the wire contract of every endpoint**.
+
+**Why up front:** `routing-controllers` couples four concerns that are usually thought of separately — routing, param binding, DI resolution (`typedi`), and *auto-triggering `class-validator`* on `@Body()` DTOs. Removing it breaks all four at once. Doing that on Express first means you reproduce those four behaviors (function routing, direct param access, plain-module/ALS DI, and **manual** validation invocation) against a framework you're not simultaneously replacing, so any contract regression is unambiguously attributable to the de-decorating, not to Fastify.
+
+### Current stack (verify against the repo)
+- HTTP: `express@^4.21.2`
+- Routing/DI: `routing-controllers@0.11.3`, `typedi@0.8.0`, `reflect-metadata`, `require-all`
+- Custom decorators: `@ReqPathParam`, `@ReqQueryParam`, `@ReqHeaderParam` (and likely `@Req`, `@Res`, `@Body`, controller decorators), plus custom validators (`FutureDate`, `BetweenDates`, `PastDate`, `ValidDate`) and `WebSocketDecorators`
+- Custom middleware classes: `ContextMiddleware`, `TimeoutMiddleware`, a request/logging middleware, `NoCacheMiddleware`
+- GraphQL: `@apollo/server@4.13.0`
+- WebSockets / streaming: `ws@8.x`, plus an `SSE.ts`
+- Validation: `class-validator@^0.14.3`
+- Express middleware: `express-rate-limit`, `express-slow-down`, `express-timeout-handler`, `helmet`, `cors`, `compression`, `morgan`, `nocache`, `raw-body`
+- Observability: full OpenTelemetry stack (`@opentelemetry/sdk-node`, `auto-instrumentations-node`, metrics/resources/semantic-conventions), `elastic-apm-node`, `prom-client`
+- Utilities (framework-agnostic, keep as-is): `decimal.js`, `dayjs`, `json-bigint`, `http-status-codes`
+- TypeScript 5.5.4, `ts-node`, dual-publish concerns (see §6.13)
+
+---
+
+## 2. Non-negotiable constraints
+
+1. **Wire contract is frozen across BOTH stages.** Every route's path, method, success status code, error status code, response body shape, and error body shape must be **byte-for-byte equivalent** after Stage 0 *and* after Stage 1, unless a change is explicitly approved. Consumers depend on these. Write contract tests **before** touching a given route (see §7). The same tests must stay green through Stage 0 (Express) and Stage 1 (Fastify).
+2. **Dual CJS + ESM must be preserved.** This is a library. Do not introduce ESM-only dependencies. Match the existing `tsconfig` module target and packaging. If a needed dependency is ESM-only, stop and flag it — do not silently convert the whole package to ESM.
+3. **Performance must actually improve — in Stage 1.** Stage 0 is not expected to move throughput materially (still Express); do not chase perf there. The throughput win comes in Stage 1 from **JSON Schema response serialization**, not from the router. Every Stage-1 route must declare a `response` schema. A route with no response schema is an incomplete Stage-1 migration.
+4. **Observability must not regress in either stage.** Traces, spans, APM transactions, and Prometheus metrics that exist today must still be produced across Stage 0 and Stage 1, with the same correlation/trace IDs flowing through logs.
+5. **Security posture must not regress, and Stage 1 must address the known Fastify validation-bypass class.** See §6.14.
+6. **No `@fastify/express` in the final state.** It may be used as a *temporary* bridge during Stage 1, but it reintroduces Express overhead and must be removed before completion. If you use it, track its removal as a blocking task. (Stage 0 does not use it — Stage 0 *is* Express.)
+7. **Do not guess at unknowns. Flag them.** A list of things to surface rather than assume is in §9.
+
+---
+
+## 3. Operating principles
+
+- **Inspect first.** Before migrating any area, read the corresponding source files end-to-end. The decorator and middleware names above are a guide; the repo is authoritative.
+- **Stage 0 before Stage 1, always.** Do not begin the Fastify swap for a route group until that group is decorator-free and green on Express. Do not interleave the two stages within one commit.
+- **Preserve, then optimize.** First reach behavioral parity; only then apply idiomatic refactors. Don't do both in the same commit.
+- **Phase by route group, within each stage.** Migrate one controller/resource at a time behind contract tests. Keep the suite green at every step.
+- **Encapsulate.** In Stage 0 each former controller becomes a **plain Express router module** (function handlers). In Stage 1 that same module becomes a **Fastify plugin** (routes + schemas + route-scoped hooks). Design the Stage 0 module boundary so the Stage 1 conversion is mechanical.
+- **One commit per concern, with the contract tests that prove parity.**
+
+---
+
+## 4. Phased plan
+
+### Stage 0 — Remove `routing-controllers` + `typedi` on Express
+
+0.1 **Capture the contract.** Before deleting anything, write contract tests (supertest against the running Express app) for each route: status code, response body, error body, and — critically — the **validation-error shape** and the **RC global-error-handler shape** (§6.8). These are your invariants for the whole migration.
+
+0.2 **Inventory & classify.** Enumerate every `@JsonController`, its base path/`routePrefix`, its methods, its param decorators, its `@Middleware`/`UseBefore`/`UseAfter` usage, its `@CurrentUser` usage, and every `typedi` `@Service()` it depends on. Record each service's **lifetime** (singleton vs request-scoped) — this drives §6.4.
+
+0.3 **Controllers → plain Express routers.** Convert each controller class to a router module of function handlers. Map param decorators to direct `req` access (§6.1). Preserve base paths exactly (§6.12).
+
+0.4 **DI removal (`typedi`).** Singletons → module-level factories/singletons; request-scoped state → `AsyncLocalStorage` established in an early Express middleware (§6.4). Preserve service lifetimes exactly.
+
+0.5 **Reproduce RC's implicit validation.** RC auto-ran `class-validator` on `@Body()` DTOs. With RC gone, that trigger is gone even though `class-validator` remains. Add explicit `plainToInstance` + `validate(...)` (matching RC's configured `validation` options — `whitelist`, `forbidNonWhitelisted`, `skipMissingProperties`, etc.) via a small validation middleware/helper, throwing the **same error shape** as before (§6.2, §6.8). `class-validator`, `class-transformer`, and `reflect-metadata` **stay** in Stage 0.
+
+0.6 **RC middleware/error classes → plain Express.** Convert `@Middleware`/`ExpressMiddlewareInterface` classes to plain `(req,res,next)` middleware. Reproduce RC's global error handler and `HttpError` subclasses as a plain Express error-handling middleware that emits the **exact** captured error body (§6.8).
+
+0.7 **`@CurrentUser` → auth middleware.** Reproduce RC's `currentUserChecker` as middleware that populates `req.user` (from the ALS store or directly).
+
+0.8 **WebSocket decorators → plain `ws`.** Replace `WebSocketDecorators` with direct `ws` server wiring for now (Stage 1 moves this to `@fastify/websocket`). Preserve auth and message handling.
+
+0.9 **Controller discovery.** Replace `routing-controllers`' controller globbing with explicit route-module registration (or keep `require-all` purely as a file loader if you prefer). Remove RC's `useExpressServer`/`createExpressServer` bootstrap.
+
+0.10 **Decommission Stage-0 targets.** Remove `routing-controllers`, all RC param/controller decorators, and `typedi` (or keep `typedi` only as a routing-decoupled container per §6.4). **Do not** remove `reflect-metadata` yet — `class-validator` still needs it; its removal is a Stage-1 task.
+
+**Stage 0 exit criteria:** no `routing-controllers` import, no RC/typedi decorators anywhere in the routing layer, all handlers are functions, full contract suite green **on Express**, observability unchanged.
+
+### Stage 1 — Swap Express → Fastify
+
+1. **Scaffold & bootstrap.** Stand up a Fastify instance (`fastify({ logger, genReqId, ... })`), wire the global plugins (helmet, cors, compress, rate-limit), set up the error handler, and confirm the OTel/APM init ordering (§6.10). No routes yet.
+2. **Public API inventory (finalize).** The function-based public surface was defined in Stage 0; confirm it and finalize the breaking-change list for the **major version bump** (§8).
+3. **Cross-cutting layer.** Port the (now plain-Express) middleware to Fastify lifecycle hooks (§6.3), carry the `AsyncLocalStorage` context from Express middleware into an `onRequest` hook (§6.4), logging + redaction (§6.9), and the error-shape contract (§6.8).
+4. **Validation layer.** Replace the Stage-0 manual `class-validator` invocation with the JSON Schema / TypeBox convention; port the custom validators (§6.2). This is where `class-validator` and `reflect-metadata` finally leave.
+5. **Routes, group by group.** Convert each Express router to a Fastify plugin of function handlers with full request **and response** schemas (§6.1). Contract-test each before moving on.
+6. **GraphQL.** Integrate Apollo via `@as-integrations/fastify` (§6.6).
+7. **WebSockets & SSE.** Port the Stage-0 plain-`ws` wiring to `@fastify/websocket`; port SSE as a streaming route (§6.7).
+8. **Decommission.** Remove `reflect-metadata`, `class-validator`, `require-all` (if still present), all `express*` packages, `morgan`, `nocache`, and any temporary `@fastify/express` bridge. Confirm no `import 'reflect-metadata'` or decorator metadata remains.
+9. **Verify.** Full contract suite, load/throughput comparison vs. the Express baseline, observability smoke test, dual CJS+ESM build check.
+
+---
+
+## 5. Dependency swap (now in two waves)
+
+### Wave 0 — Stage 0 (Express stays)
+
+| Remove | Add | Notes |
+|---|---|---|
+| `routing-controllers`, RC param/controller decorators | — (plain `express.Router`) | function handlers; explicit route-module registration |
+| `typedi` | optional — drop, or keep as a routing-decoupled container | §6.4; preserve service lifetimes |
+| RC controller globbing (`useExpressServer`) | explicit imports (or keep `require-all` as a plain loader) | §6.12 |
+| `WebSocketDecorators` | direct `ws` wiring (interim) | moves to `@fastify/websocket` in Stage 1 |
+
+**Kept through Stage 0:** `express`, `class-validator`, `class-transformer`, `reflect-metadata`, and all existing Express middleware (`helmet`, `cors`, `compression`, `morgan`, `nocache`, `express-rate-limit`, `express-slow-down`, `express-timeout-handler`, `raw-body`). You now invoke `class-validator` manually (§0.5).
+
+### Wave 1 — Stage 1 (Express → Fastify)
+
+| Remove | Add | Notes |
+|---|---|---|
+| `express`, remaining Express middleware | `fastify`, `@fastify/autoload` | function handlers; autoload replaces controller globbing |
+| `class-validator`, `class-transformer`, `reflect-metadata` | `@sinclair/typebox` + `@fastify/type-provider-typebox` (preferred) **or** `fastify-type-provider-zod` | keeps TS types + schema unified; compiles serializer for the perf win. **Only now** does `reflect-metadata` leave. |
+| `express-rate-limit` | `@fastify/rate-limit` | onRequest hook, IP-based, Redis store option, per-route override |
+| `express-slow-down` | `rate-limiter-flexible` | already approved; gives the progressive-delay behavior `@fastify/rate-limit` does not |
+| `express-timeout-handler` | native `connectionTimeout` / route `preHandler` w/ `AbortController` | Fastify has first-class timeouts; `connect-timeout` does not work here |
+| `helmet` | `@fastify/helmet` | preserve existing CSP/header config exactly |
+| `cors` | `@fastify/cors` | preserve existing origin/credentials config |
+| `compression` | `@fastify/compress` | runs late in the lifecycle (onSend) |
+| `morgan` | **drop** → built-in Pino | structured + faster; configure to satisfy existing log expectations (§6.9) |
+| `nocache` | `@fastify/helmet` no-cache headers or an `onSend` hook | folds into helmet |
+| `@apollo/server` (keep) | `@as-integrations/fastify` | §6.6 |
+| interim plain `ws` wiring | `@fastify/websocket` | built on `ws`; same underlying lib |
+| `raw-body` (if used for signatures) | `@fastify/raw-body` or a custom content-type parser | §6.11 — do not lose the raw buffer |
+| OTel stack, `elastic-apm-node`, `prom-client` (keep) | add `@opentelemetry/instrumentation-fastify`; optionally `fastify-metrics` | §6.10 |
+| `decimal.js`, `dayjs`, `json-bigint`, `http-status-codes` (keep) | — | framework-agnostic |
+
+> Optional but recommended (Stage 1): `@fastify/sensible` for `httpErrors.*` helpers (§6.8) and `@fastify/under-pressure` for load shedding.
+
+Pin Fastify and all `@fastify/*` plugins to current patched releases (see §6.14) and keep them on the same major as `fastify`.
+
+---
+
+## 6. Detailed migration nuances
+
+### 6.1 Decorators → function handlers (the core Stage-0 change)
+
+Delete `routing-controllers` controllers. **In Stage 0** each controller class becomes a **plain Express router module**; **in Stage 1** that same module becomes a **Fastify plugin**. Map the param decorators to direct request access — identically in both frameworks:
+
+| routing-controllers | Stage 0 (Express) | Stage 1 (Fastify) |
+|---|---|---|
+| `@JsonController('/users')` + method decorators | `const r = Router(); r.get(...)` mounted at `/users` | a plugin that calls `fastify.get/post/...('/users/...', opts, handler)` |
+| `@Get('/:id')` / `@Post()` / … | `r.get('/:id', ...)` etc. | `fastify.get('/:id', ...)` etc. |
+| `@ReqPathParam('id')` / `@Param('id')` | `req.params.id` | `request.params.id` |
+| `@ReqQueryParam('q')` / `@QueryParam('q')` | `req.query.q` | `request.query.q` |
+| `@ReqHeaderParam('h')` / `@HeaderParam('h')` | `req.headers['h']` | `request.headers['h']` |
+| `@Body()` | `req.body` (validate manually, §0.5) | `request.body` (validated by schema) |
+| `@Req()` / `@Res()` | `req` / `res` | `request` / `reply` |
+| `@CurrentUser()` | `req.user`, set by auth middleware (§0.7) | `request.user`, set by an auth `preHandler` (§6.4) |
+| `@HttpCode(201)` | `res.status(201)` | `reply.code(201)` or `response` schema keyed by status |
+| return value (auto-serialized) | `res.json(value)` | `return value` (Fastify serializes via the response schema) |
+| throwing `NotFoundError`, … | throw → plain Express error middleware (§6.8) | throw `httpErrors.notFound()` / set `reply.code()` + throw (§6.8) |
+
+**Shapes at each stage:**
+```ts
+// BEFORE — routing-controllers
+@JsonController('/users')
+export class UserController {
+  constructor(private svc: UserService) {}        // typedi injection
+  @Get('/:id') @HttpCode(200)
+  async getUser(@ReqPathParam('id') id: string,
+                @ReqQueryParam('full') full: boolean) {
+    const u = await this.svc.find(id, full);
+    if (!u) throw new NotFoundError('user not found');
+    return u;
+  }
+}
+
+// STAGE 0 — plain Express router, function handler, manual validation, no decorators/DI
+import { Router } from 'express';
+const svc = makeUserService(/* deps */);            // module singleton, see §6.4
+export const userRouter = Router();
+userRouter.get('/:id', async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const full = req.query.full === 'true';         // reproduce RC's coercion
+    const u = await svc.find(id, full);
+    if (!u) throw new NotFoundError('user not found'); // caught by error middleware (§6.8)
+    res.status(200).json(u);
+  } catch (e) { next(e); }
+});
+// mounted elsewhere: app.use('/users', userRouter);
+
+// STAGE 1 — plugin registered on the package's `nodecore` instance (see §6.1a),
+//            schema-driven, compiled serializer
+import type { NodeCorePluginAsync } from '@your-org/nodecore'; // the package's own type
+import { Type } from '@sinclair/typebox';
+
+export const userRoutes: NodeCorePluginAsync = async (nodecore) => {
+  const svc = makeUserService(/* deps */);          // plain module factory, no typedi
+
+  nodecore.get('/users/:id', {
+    schema: {
+      params: Type.Object({ id: Type.String() }),
+      querystring: Type.Object({ full: Type.Optional(Type.Boolean()) }), // coercion via schema
+      response: { 200: UserSchema, 404: ErrorSchema }, // 200 schema => compiled serializer
+    },
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { full } = request.query;
+    const u = await svc.find(id, full ?? false);
+    if (!u) throw nodecore.httpErrors.notFound('user not found'); // setErrorHandler shapes body
+    return u;                                          // serialized via response schema
+  });
+
+  nodecore.post('/users', {
+    schema: {
+      body: CreateUserSchema,                          // replaces class-validator on the DTO
+      response: { 201: UserSchema },
+    },
+  }, async (request, reply) => {
+    reply.code(201);                                   // replaces @HttpCode(201)
+    return svc.create(request.body);
+  });
+};
+```
+Note: in Stage 1, validation/coercion moves **before** the handler via the schema. Remove the Stage-0 manual coercion/validation from the handler body, but **only** once the schema reproduces the same constraints. All route registration and instance-level calls (`.get/.post/...`, `.httpErrors`, hooks, decorators, `.register`) go through the `nodecore` instance parameter, **never** a bare `fastify` — see §6.1a.
+
+### 6.1a The `nodecore` instance convention (public boundary)
+
+Every route plugin receives the package's HTTP instance as a parameter named **`nodecore`**, not `fastify`. This is the single public boundary between consumers and the underlying framework:
+
+- **Plugins are typed as `NodeCorePluginAsync`** (the package's exported alias), and the instance is `NodeCoreInstance`. Consumers import these from the package (`@your-org/nodecore`), never from `fastify`. Do not re-export raw `FastifyInstance`/`FastifyPluginAsync` from the entry point.
+- **All instance-level calls go through `nodecore`:** `nodecore.get/post/put/delete/patch`, `nodecore.register`, `nodecore.addHook`, `nodecore.decorate`, `nodecore.setErrorHandler`, `nodecore.httpErrors.*`. There should be **no bare `fastify.` reference inside a plugin.** (This is why the example's error throw is `nodecore.httpErrors.notFound(...)`, not `fastify.httpErrors...`.)
+- **Decide the abstraction depth up front (this is a §8.3 call):**
+  - *Type-alias (minimal):* `export type NodeCoreInstance = FastifyInstance` and `export type NodeCorePluginAsync = FastifyPluginAsync`. Cheapest, and it already stops consumers importing `fastify` by name — but the *shape* is still Fastify's, so a future Fastify major could leak through.
+  - *Curated facade (stronger):* export a `NodeCoreInstance` interface exposing only the methods you support, backed by a Fastify instance internally. More work, but Fastify becomes a true implementation detail and `request`/`reply` handler types are yours to control.
+  - Pick one, document it in §8, and apply it uniformly. Whichever you choose, the **handler signature `(request, reply)` types are part of the public contract** — pin them to package-owned types if you want Stage-1-and-beyond framework swaps to stay non-breaking.
+- The package's bootstrap constructs the real `fastify({ ... })` once, wraps/brands it as `NodeCoreInstance`, and hands *that* to `@fastify/autoload`. Plugins never see or construct the raw Fastify object.
+- **Stage 0 alignment:** if consumers already register routes through a package helper in the Express phase, name and shape that helper so its Stage-0 signature matches the Stage-1 `nodecore` surface as closely as possible — otherwise the handler-arg types change between stages and you incur the second public break §8.3 warns about.
+
+### 6.2 Validation
+
+**Stage 0:** `class-validator` stays. The only change is that *you* now trigger it (RC used to). Reproduce RC's configured `validation` options exactly and throw the same error shape (§6.8). Do not convert to JSON Schema yet.
+
+**Stage 1:** each `class-validator` DTO becomes a schema. Preserve the **exact** constraints — do not loosen them. Reference mapping:
+
+| class-validator | schema |
+|---|---|
+| `@IsString()` | `type: 'string'` |
+| `@IsInt()` / `@IsNumber()` | `type: 'integer'` / `type: 'number'` |
+| `@IsBoolean()` | `type: 'boolean'` (with coercion for querystring) |
+| `@IsEmail()` | `format: 'email'` |
+| `@Min(n)` / `@Max(n)` | `minimum` / `maximum` |
+| `@Length(a,b)` / `@MinLength` / `@MaxLength` | `minLength` / `maxLength` |
+| `@IsEnum(E)` | `enum: [...]` |
+| `@IsOptional()` | omit from `required` |
+| `@ValidateNested()` + `@Type(() => X)` | nested object schema |
+| `@IsArray()` + element decorators | `type: 'array', items: {...}` |
+| custom validators (`FutureDate`, `PastDate`, `BetweenDates`, `ValidDate`) | **custom AJV keywords/formats** or TypeBox refinements |
+
+**Custom validators** (`FutureDate`, etc.): in Stage 0 they keep working as-is (they're `class-validator` decorators, independent of RC). In Stage 1, register them as AJV custom keywords/formats on the Fastify AJV instance, or as a `preValidation` check that throws the same error. Do **not** drop the semantics. If a custom validator encoded business rules (e.g. "date must be after today"), reproduce it precisely and unit-test it against the old behavior.
+
+Set AJV options (Stage 1) to match prior behavior where it matters (`coerceTypes`, `removeAdditional`, `useDefaults`). Decide explicitly whether unknown properties were previously allowed (RC's `whitelist`/`forbidNonWhitelisted`); mirror that with `additionalProperties`.
+
+### 6.3 Middleware → the right stage in each framework
+
+**Stage 0:** convert RC `@Middleware`/`ExpressMiddlewareInterface` classes to plain Express `(req,res,next)` middleware, preserving registration order and per-route scoping.
+
+**Stage 1:** map each Express middleware to the correct Fastify lifecycle stage — `onRequest → preParsing → preValidation → preHandler → handler → preSerialization → onSend → onResponse` — **not** blindly to `onRequest`:
+
+| Middleware | Fastify hook | Notes |
+|---|---|---|
+| `ContextMiddleware` (request context / correlation) | `onRequest` + `AsyncLocalStorage` | establish the request store early; §6.4 |
+| auth / token validation | `preHandler` (or a route-scoped decorator) | sets `request.user` |
+| request/response logging middleware | mostly **removed** → Pino `onResponse` | keep only custom fields |
+| `TimeoutMiddleware` | route `connectionTimeout` / `preHandler` w/ `AbortController` | per-route timeouts are cleaner here |
+| `NoCacheMiddleware` | `onSend` (set `Cache-Control`) or `@fastify/helmet` | header mutation belongs in `onSend` |
+| body/raw capture | `preParsing` / content-type parser | §6.11 |
+
+Scope hooks to the plugin/route where they applied, not globally. Verify the **effective order** matches the old chain for any route where ordering had observable effects (e.g. auth before rate-limit vs after).
+
+### 6.4 DI removal (`typedi`) + request context — done in Stage 0
+
+`routing-controllers` resolved controllers and `@CurrentUser`/services through `typedi`. Going function-based (Stage 0), choose per service lifetime:
+
+- **Singletons** (`@Service()` with no request state) → plain module-level singletons or factory functions. Simplest; prefer this.
+- **Request-scoped state** (correlation IDs, per-request user/tenant, anything `ContextMiddleware` stored on the request) → **`AsyncLocalStorage`**. Establish the store in an early Express middleware in Stage 0; in Stage 1 the *same* store is established in an `onRequest` hook. This replaces typedi's request container and is the idiomatic Node approach across both frameworks.
+- You **may** keep `typedi` purely as a DI container decoupled from routing if the service graph is large — but if you do, document why, and ensure it doesn't drag `reflect-metadata` decorator usage back into the routing layer. (Note: `reflect-metadata` is present anyway until Stage 1 because of `class-validator`.)
+
+Whichever you choose, **preserve service lifetimes** — turning a request-scoped service into a singleton (or vice-versa) is a behavior change and a potential cross-request data-leak bug. Flag any service whose scope is ambiguous.
+
+### 6.6 GraphQL: Apollo Server 4 → `@as-integrations/fastify` (Stage 1)
+
+- Install `@as-integrations/fastify`. Construct `ApolloServer` and **include `fastifyApolloDrainPlugin(fastify)` in its `plugins`** array (required for graceful shutdown / draining).
+- `await apollo.start()` **before** registering the integration.
+- Apollo 4 moved context out of the constructor: provide a context function `(request, reply) => Promise<Context>` (typed `FastifyRequest`/`FastifyReply`). Port whatever the old context builder did (auth, loaders, tenant) into this function. (In Stage 0, keep the existing Express Apollo middleware wiring untouched — GraphQL moves only in Stage 1.)
+- Register either as a plugin on the existing GraphQL path, or via `fastifyApolloHandler` inside an explicit route. Keep the **same path and methods** as today.
+- **Subscriptions:** Apollo Server 4 does **not** handle WS subscriptions itself. If the current setup has GraphQL subscriptions, that is a separate `graphql-ws` + `@fastify/websocket` wiring — **do not assume it carries over; flag it** (§9).
+
+### 6.7 WebSockets and SSE
+
+- **Stage 0:** replace `WebSocketDecorators` with direct `ws` server wiring; preserve auth and message handling.
+- **Stage 1 — WebSockets:** move to `@fastify/websocket` (built on `ws`). Use `fastify.get('/path', { websocket: true }, (connection, request) => { ... })`. The connection/lifecycle API differs from raw `ws`; port handlers accordingly and preserve auth (do it in `preValidation`/`onRequest` for the upgrade route).
+- **Stage 1 — SSE (`SSE.ts`) is not WebSockets.** It's a long-lived `text/event-stream` HTTP response. Implement as a route that writes to `reply.raw` (or use a small SSE plugin), sets the right headers, and handles client disconnect. Keep the event format and heartbeat behavior identical. Migrate SSE and WS as **separate** concerns.
+
+### 6.8 Error handling + error-shape contract
+
+- `routing-controllers` had `HttpError` subclasses and a global error handler producing a specific JSON error shape. **Capture that exact shape first** (status code + body) from the current code/tests, in Stage 0 §0.1.
+- **Stage 0:** reproduce that shape in a plain Express error-handling middleware, and reproduce the validation-error shape from your manual `class-validator` invocation. This interim Express implementation becomes a concrete, tested reference for Stage 1.
+- **Stage 1:** set a global `setErrorHandler` (and optionally `@fastify/sensible`'s `httpErrors`) that reproduces the same body for the same conditions. Override Fastify's default 400 validation body via `setErrorHandler` and/or `schemaErrorFormatter` to match the shape you preserved in Stage 0. This is a contract item, not cosmetic.
+- Ensure thrown errors still get traced/reported to APM (§6.10) in both stages.
+
+### 6.9 Logging: drop `morgan` → built-in Pino (Stage 1)
+
+- `morgan` stays through Stage 0. In Stage 1, configure Fastify's Pino logger. Set `genReqId` to derive from the incoming correlation header if one exists, and wire `request.id` to the OTel trace ID so logs ↔ traces correlate.
+- **Banking/PII redaction is mandatory.** Use Pino's `redact` to strip auth headers, tokens, account numbers, PANs, and any sensitive body fields. Inventory what the current logging exposed and ensure the new logs are at least as redacted (preferably more).
+- Reproduce any log fields downstream systems parse (request id, latency, status, route). Remove `morgan` only after parity is confirmed.
+
+### 6.10 Observability preservation (critical ordering)
+
+- **Init order:** the OTel SDK (`@opentelemetry/sdk-node`) and instrumentations must be **started before the HTTP framework is imported/instantiated**, or auto-instrumentation won't attach. This is true in both stages — verify the tracing bootstrap still loads first (e.g. `node -r ./dist/tracing.js`) after Stage 0's router changes and again after Stage 1.
+- Stage 1: add `@opentelemetry/instrumentation-fastify` (confirm it's enabled within `auto-instrumentations-node`) so Fastify routes produce spans equivalent to the old Express instrumentation.
+- `elastic-apm-node` auto-instruments both Express and Fastify; confirm transactions are named by route and errors are captured in each stage.
+- `prom-client`: keep the existing registry/metrics, or adopt `fastify-metrics` (Stage 1). Either way, **preserve metric names and labels** so dashboards/alerts keep working.
+
+### 6.11 Raw body / webhook signature verification (Stage 1 gotcha)
+
+If `raw-body` was used to verify webhook/HMAC signatures (common for payment/bank callbacks), Express currently gives you the raw bytes; Fastify parses JSON before your handler sees it, destroying them. In Stage 1 use **`@fastify/raw-body`** (or a custom `addContentTypeParser` with `parseAs: 'buffer'`) on the specific signature-verifying routes to retain the raw buffer **alongside** the parsed body. Losing the raw body silently breaks signature checks — verify these routes explicitly. (Stage 0 leaves `raw-body` intact.)
+
+### 6.12 Routing discovery
+
+- **Stage 0:** replace `routing-controllers`' controller discovery with explicit route-module registration (`app.use(prefix, router)`), preserving every base path/`routePrefix`.
+- **Stage 1:** replace that with **`@fastify/autoload`** pointed at the routes/plugins directory. Preserve route prefixes via autoload's `dirNameRoutePrefix` or explicit prefixes so URLs don't change.
+
+### 6.13 Dual CJS + ESM preservation (both stages)
+
+- Keep the package's existing module system and build output at every step. Express, Fastify, and all `@fastify/*` plugins are dual, so this is achievable.
+- In **CJS** use `require('@fastify/x')` / `fastify.register(require('@fastify/x'))`; the `await fastify.register(import('@fastify/x'))` form in some docs is ESM-only — don't mix it into a CJS build.
+- Before merging **each stage**, build and import the package both ways (a `require()` smoke test and an `import` smoke test) to prove dual consumption still works. Do not add any ESM-only dependency without flagging it (§9).
+
+---
+
+## 6.14 Security requirements (Stage 1 — must address, not just "don't regress")
+
+Fastify's recent **core** CVEs cluster on **content-type / schema-validation bypasses** — malformed `Content-Type` headers (casing, tab, trailing garbage, leading space) slipping past validation. Because Stage 1 leans on schema validation for both correctness and performance, you must:
+
+1. **Pin to the latest patched Fastify** (5.8.5+ at time of writing — check for newer) and keep `@fastify/*` plugins on matching, patched versions. Add a CI check / Snyk (or `npm audit`) gate.
+2. **Do not treat schema validation as an authorization boundary.** Schemas shape input; real authz/authn checks must run independently in hooks (§6.3/§6.4) and not be bypassable by a malformed content-type.
+3. Avoid relying solely on per-content-type `schema.body.content` for security-critical validation until you've confirmed the running version patches the known bypasses.
+4. Preserve the existing `helmet`/CSP, CORS origin allow-list, and rate-limit thresholds exactly. Re-verify them after Stage 1.
+5. Keep `rate-limiter-flexible` configured for the brute-force/DoS protections the old `express-slow-down` provided; don't downgrade to a plain hard-limit if progressive delay was relied upon.
+
+(Stage 0 keeps the existing Express security middleware unchanged; re-verify it is still wired after the router refactor.)
+
+---
+
+## 7. Testing & verification
+
+- **Contract tests first, and they span both stages.** For each endpoint, write tests asserting status code, response body, error body, **and validation-error shape** against the current RC-based Express implementation *before* migrating it. Those same tests must pass after Stage 0 (still Express) and after Stage 1 (Fastify). The double duty is a feature: one suite guards two hops.
+- **Test harness per stage:** Stage 0 uses supertest against the Express app; Stage 1 switches route tests to **`fastify.inject()`** (in-process, no socket).
+- **Parity over snapshots:** assert the actual contract (shape, codes), not internal implementation.
+- **Validation tests:** for every ported DTO/custom validator, test that previously-rejected input is still rejected and previously-accepted input still accepted — verify after both stages.
+- **Observability smoke test:** after each stage, hit representative routes and confirm spans, APM transactions, and Prometheus metrics appear with the expected names/labels and correlated IDs.
+- **Throughput check (Stage 1):** benchmark a representative route (e.g. `autocannon`) on the Express baseline vs Fastify to confirm the perf goal and that response schemas are actually compiled (a missing response schema shows up as no serialization speedup).
+- **Dual-build check:** prove both `require()` and `import` consumption after each stage (§6.13).
+- Keep the existing Jest setup; port `preprocessor.js`/config as needed.
+
+---
+
+## 8. Public API & breaking changes (it's a library)
+
+This package exposes an API other services build on. Removing the decorators is a **breaking change for consumers** that used them — and that removal lands in **Stage 0**.
+
+1. Inventory the entry-point exports and classify each as kept / changed / removed.
+2. Design the **new function-based public surface** (the helpers/factories consumers use instead of decorators) in Stage 0.
+3. **Framework-type leakage — flag and decide.** If the Stage-0 public helpers expose Express types (`Request`/`Response`), those become Fastify types in Stage 1, which is a *second* breaking change to the public surface. The mitigation is the **`nodecore` instance convention (§6.1a)**: consumers register routes on a package-owned `NodeCoreInstance` and import `NodeCorePluginAsync` from the package, never `fastify` directly. Choose the abstraction depth (type-alias vs curated facade) here and record it — a curated facade keeps Fastify an implementation detail so Stage 1 (and future framework swaps) stays an internal, non-breaking change. Where leakage is unavoidable, flag it and account for it in the version plan.
+4. **Version strategy — one major, not two.** Recommended: bundle both stages into a single major version bump released at the end of Stage 1; freeze the public function-based surface at Stage 0 so it doesn't churn between stages. If you need an interim release, you *may* ship the decorator-free Express package as its own major after Stage 0 — but only if §8.3 is clean (no further public break in Stage 1). Decide this explicitly and document it. Do not ship decorator removal as a minor/patch.
+5. Produce a **breaking-change list and consumer migration notes**. If a transition window is needed, consider shipping the new API and deprecating the old surface, but **do not** keep `routing-controllers` alive long-term.
+
+---
+
+## 9. Flag, don't guess
+
+Stop and surface (don't assume) when you hit:
+- **RC's exact `validation` configuration** (`whitelist`, `forbidNonWhitelisted`, `skipMissingProperties`, `transform` options) — you must reproduce it in Stage 0's manual invocation; capture it from the RC bootstrap, don't guess.
+- **The exact current error-body and validation-error shapes** if they aren't covered by existing tests — capture from code/QA in Stage 0 before changing anything.
+- **RC response transformation** (`classToPlain`/`transformResponse` on returned objects) if enabled — it changes serialized output; reproduce it in Stage 0.
+- Any **service whose lifetime/scope is ambiguous** (singleton vs request-scoped) — getting this wrong risks cross-request data leaks.
+- **Framework-type leakage in the public API** (§8.3) — whether Stage 1 causes a second public break.
+- **GraphQL subscriptions** over WebSockets — Apollo 4 doesn't carry these over; needs separate wiring (Stage 1).
+- Any **ESM-only dependency** surfacing as a transitive requirement.
+- **Routes doing raw-body signature verification** — confirm before changing body parsing in Stage 1.
+- Any endpoint where **middleware order had observable effects** and the new order (Express registration order in Stage 0, hook order in Stage 1) might differ.
+- **Custom validator business rules** that aren't obvious from the decorator name.
+- Anything where preserving the wire contract conflicts with framework idioms — preserve the contract and flag the tension.
+
+---
+
+## 10. Definition of done
+
+### Stage 0 (Express, decorator-free) — exit gate before starting Stage 1
+- [ ] `routing-controllers` and all RC param/controller decorators removed; all handlers are plain Express function handlers.
+- [ ] `typedi` removed from the routing layer (or documented as a routing-decoupled container); service lifetimes preserved via module singletons + `AsyncLocalStorage`.
+- [ ] `class-validator` invoked manually with RC's exact validation options; validation-error shape matches the captured contract.
+- [ ] RC error handler + `HttpError` classes reproduced as plain Express error middleware; error body byte-for-byte equal.
+- [ ] `@CurrentUser` reproduced as auth middleware; `WebSocketDecorators` replaced with plain `ws`.
+- [ ] Route prefixes/base paths unchanged; controller globbing replaced with explicit registration.
+- [ ] Full contract suite green **on Express**; observability, dual CJS+ESM build unchanged.
+- [ ] `reflect-metadata` intentionally **retained** (still needed by `class-validator`).
+
+### Stage 1 (Fastify) — final
+- [ ] All routes are function-based Fastify handlers; every route declares request **and response** schemas; serialization speedup confirmed.
+- [ ] `class-validator` and `reflect-metadata` removed; all DTOs + custom validators reproduced as schemas/keywords with parity tests passing.
+- [ ] Middleware ported to the correct lifecycle hooks; effective order verified.
+- [ ] `AsyncLocalStorage` context carried from Express middleware into `onRequest`; lifetimes preserved.
+- [ ] Apollo integrated via `@as-integrations/fastify` with drain plugin; same GraphQL path/contract.
+- [ ] WebSockets on `@fastify/websocket`; SSE ported separately; both auth-checked.
+- [ ] Error handler reproduces the exact status/body contract, including validation errors.
+- [ ] Pino logging with PII redaction; correlation IDs ↔ traces; `morgan` removed.
+- [ ] OTel/APM/prom-client preserved with same names/labels; init ordering verified.
+- [ ] Raw-body signature routes verified intact.
+- [ ] All `express*` packages, `morgan`, `nocache`, `require-all`, and any temporary `@fastify/express` bridge removed.
+- [ ] Fastify + plugins pinned to patched versions; audit/Snyk gate green; §6.14 items addressed.
+- [ ] Dual CJS + ESM consumption proven; contract suite green; throughput improved vs baseline; observability smoke test passes.
+- [ ] Public API breaking changes documented; single major version bumped; consumer migration notes written.
