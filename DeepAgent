@@ -1,0 +1,301 @@
+# Deep Agent Capabilities — Final Implementation Plan
+
+**Package:** internal wrapper exposing a `createAgent`-based ReAct factory to consuming teams.
+**Shape of work:** Phase 0 is an upgrade. Phases 1–4 are purely additive capability work.
+**Audience:** an implementing agent with repo write access that can run the build and test suite. Where this says *inspect*, read the code — notes below are the map, not the territory.
+
+---
+
+## The one-line thesis
+
+All four capabilities answer the same constraint — **the context window**. Planning keeps state that survives compaction; filesystem moves memory outside context; subagents create additional contexts; summarization compresses the context you have. Consumers are not buying four features. They are buying: *the agent survives a 50-step task instead of dying at step 10, and costs less doing it.*
+
+Ship the story that way. `profile: 'react'` stays the default for short-horizon agents; `profile: 'deep'` is for unbounded-step work. **If an agent finishes in under ~10 tool calls, `deep` costs more and buys nothing.** Say that in the README.
+
+---
+
+# PHASE 0 — Upgrade the stack
+
+Blocking. Nothing in Phases 1–4 starts until this is green.
+
+## Target versions
+
+| Package | From | To |
+|---|---|---|
+| `langchain` | 1.1.5 | ^1.5.4 |
+| `@langchain/core` | 1.1.4 | ^1.2.3 |
+| `@langchain/langgraph` | 1.0.x | ^1.4.7 |
+| `@langchain/langgraph-checkpoint` | 0.1.1 | ^1.1.3 |
+
+## Verified ground truth
+
+Established by diffing every exported symbol in every `.d.ts` across all four package tarballs, plus reading the monorepo changesets:
+
+- **Zero exported symbols removed** in any of the four packages. No subpaths removed. `langchain` adds 203 symbols, `langgraph` 125, `core` 11 new subpaths.
+- **No `Major Changes` changelog entries** for `langchain` or `@langchain/core` anywhere in the 1.x line; none for `langgraph` after 1.0.0.
+- `checkpoint` 1.0.0 is a version-alignment release only — its changeset reads "updates the package for compatibility with LangGraph v1.0." The substantive breaks (`pending_sends`, `Checkpoint.writes`) were in **0.1.0**, already behind us.
+- `BaseCheckpointSaver` abstract surface is **identical**: `getTuple`, `list`, `put`, `putWrites`, `deleteThread`. 1.1.3 adds `toJSON()` and `getDeltaChannelHistory()`, both with default implementations. Custom checkpointers compile and run unmodified.
+
+**Conclusion: your code compiles. That is not the same as behaving identically.** The gotchas below are where the risk actually lives.
+
+## Gotchas — ranked by real risk
+
+### G1 — `afterModel` tool routing changed. Highest risk; lands directly on this package.
+
+`langchain@1.2.34` changed `createAgent`'s tool-call routing when `afterModel` middleware is present. Previously, `afterModel` middleware **silently forced `version: "v1"` behaviour** (all tool calls to a single `ToolNode` via `Promise.all`) regardless of the `version` setting. Now `version: "v2"` — **the default** — dispatches each tool call as a separate `Send` task.
+
+The changeset is explicitly labelled a breaking change for `version: "v2"` + `afterModel` users.
+
+**Action:** grep the repo for `afterModel` **before** bumping. Any agent using it changes tool-execution topology on upgrade. Pin `version: "v1"` on those agents to preserve current behaviour, then evaluate v2 deliberately as a separate decision. `version?: "v1" | "v2"` exists on `CreateAgentParams` in both 1.1.5 and 1.5.4, so the escape hatch is available on both sides of the bump.
+
+### G2 — `langsmith` jumps 0.3 → 0.5+. Unverified; budget time.
+
+`@langchain/core@1.1.4` depends on `langsmith ^0.3.64`. `@langchain/core@1.2.4` depends on `>=0.5.0 <1.0.0`. That is a 0.x jump across two minors, and 0.x minors are semver-breaking by definition.
+
+This is the one surface I could **not** verify — no JS changelog published at the expected path. If you use LangSmith directly (custom client, tracing config, evaluators, run trees), verify independently before committing. If you only consume tracing via env vars, risk is low.
+
+### G3 — It is one decision, not four.
+
+`langchain@1.1.5` pins core **exactly**: `"@langchain/core": "1.1.4"`, no caret. It also carries `@langchain/langgraph` and `@langchain/langgraph-checkpoint` as regular `dependencies`, not peers. Bumping `langchain` drags all three regardless.
+
+`langchain@1.5.4` requires core `^1.2.3` — `^1.2.0` is **not** sufficient.
+
+**Do not stage these bumps.** Staging buys nothing and creates intermediate states nobody tested.
+
+### G4 — zod floor moves.
+
+`@langchain/langgraph` peer goes `^3.25.32 || ^4.1.0` → `^3.25.32 || ^4.2.0`. Fine on zod 3. On zod 4.0/4.1 you must move to 4.2+.
+
+### G5 — New transitive dependencies.
+
+`langgraph` 1.4.x adds `@langchain/protocol` and `@standard-schema/spec`, drops `uuid`. `core` 1.2.x drops `ansi-styles`, `camelcase`, `decamelize`, `uuid`, adds `@standard-schema/spec`. Only matters if you have lockfile review, vendoring, or licence-audit gates.
+
+### G6 — Deprecations (not removals; all still functional through 1.x).
+
+`streamLog`, `streamEvents` v1, `RunnableWithMessageHistory` deprecated in core 1.2.x. `createReactAgent` in langgraph deprecated since 1.0.0-alpha in favour of `langchain`. Inspect for usage; schedule migration separately.
+
+### G7 — Import paths. Correction to an earlier draft of this plan.
+
+`langchain` has **no `./agents` subpath export**. Published subpaths in 1.1.5 are `.`, `./chat_models/universal`, `./hub`, `./hub/node`, `./load`, `./load/serializable`, `./storage/*`. 1.5.4 adds `./browser` and `./tools`.
+
+Every middleware is exported from the **root**:
+
+```ts
+import { createAgent, createMiddleware, todoListMiddleware,
+         summarizationMiddleware, anthropicPromptCachingMiddleware } from 'langchain';
+```
+
+`import ... from 'langchain/agents/middleware'` will fail. An earlier draft got this wrong.
+
+### G8 — Package.json discipline.
+
+LangChain packages stay in `peerDependencies` with **caret ranges, never pins** — a pin makes this package unadoptable by anyone on a different minor. Mirror into `devDependencies` so build and tests resolve. Single shared copy of `@langchain/core` is non-negotiable; two copies breaks `instanceof` on messages and tools.
+
+## What the upgrade unlocks
+
+New in `langchain@1.5.4` and relevant here:
+
+- `toolErrorMiddleware`, `bedrockPromptCachingMiddleware`, `providerToolSearchMiddleware`
+- `createSubagentTransformer` / `SubagentRunStream` — **streaming observability only.** Surfaces nested named agents on `run.subagents` when children are built with `createAgent({ name })`. It is *not* a delegation mechanism; there is still no `task` tool and no subagent middleware. Phase 3 does not shrink. It does get free nested-run visibility.
+- Still **no filesystem middleware** at any version. Phase 2 is yours regardless.
+
+## Phase 0 exit criteria
+
+- [ ] `afterModel` usage inventoried; `version: "v1"` pinned where it was previously implicit
+- [ ] LangSmith direct-usage surface inventoried and verified
+- [ ] All four packages bumped in one commit; peer ranges widened
+- [ ] Full existing test suite green, **unmodified**
+- [ ] A long-running agent smoke-tested end to end against a real provider — type compatibility does not catch behavioural drift
+- [ ] Findings recorded in `docs/deep-capabilities.md`
+
+---
+
+# PHASES 1–4 — Capabilities
+
+## Invariants for every phase
+
+1. **Existing exports frozen.** No signature change, no new required field, no changed default. New optional fields only, where `undefined` reproduces today's behaviour exactly.
+2. **Zero new runtime dependencies.** Everything builds on `langchain`, `@langchain/core`, `@langchain/langgraph`, `zod`. If a phase seems to need one, stop and escalate.
+3. **No LangChain type crosses the public boundary.** `BaseLanguageModel`, `AgentMiddleware`, `BaseCheckpointSaver`, `BaseStore` must not appear in any exported signature. This is what makes the *next* upgrade a non-event for consumers.
+4. **New code in new files.** Existing files gain only a dispatch branch guarded by a new optional field.
+5. **Per-phase regression file** — `test/regression/no-delta-<phase>.test.ts` — constructs an agent with today's config and asserts composed middleware array, bound tool names, and system prompt are unchanged. This is the enforcement mechanism, not optional.
+6. **No test calls a real provider.** Stub the model; assert what the wrapper passed to LangChain, not what LangChain did with it.
+
+## Public surface delta (entire consumer-visible addition)
+
+```ts
+interface AgentConfig {
+  // ...everything existing, untouched...
+  profile?: 'react' | 'deep';                    // default 'react'
+  planning?: boolean | { systemPrompt?: string; toolDescription?: string };
+  filesystem?: FilesystemSpec;
+  subagents?: SubagentSpec[];
+  contextManagement?: boolean | { triggerTokens?: number; keepRecentMessages?: number };
+}
+
+type FilesystemSpec =
+  | 'state' | { kind: 'state' }
+  | { kind: 'store'; namespace?: string[] }
+  | { kind: 'node'; root: string; readOnly?: boolean };
+
+interface SubagentSpec {
+  name: string;
+  description: string;          // what the parent model sees when choosing
+  systemPrompt: string;
+  model?: ModelSpec;            // defaults to parent's
+  tools?: ToolSpec[];           // defaults to parent's, minus `task`
+  filesystem?: 'inherit' | 'isolated' | false;
+}
+
+class AgentConfigError extends Error {}  // TOOL_NAME_COLLISION | UNKNOWN_BACKEND | SUBAGENT_DEPTH_EXCEEDED | ...
+```
+
+---
+
+## Phase 1 — Planning: state that survives context compaction
+
+**What it is:** `todoListMiddleware()` — a `write_todos` tool writing a structured list into a state channel, plus a system prompt on when to use it. Adapter only; the middleware ships in `langchain`.
+
+**Files:** `src/agents/capabilities/planning.ts`
+
+**Reserved names:** `write_todos`
+
+### Implementation guidelines
+
+- **Adapter, not reimplementation.** Map your `planning` config onto `TodoListMiddlewareOptions` (`systemPrompt`, `toolDescription`). Do not hand-write a planning prompt — `TODO_LIST_MIDDLEWARE_SYSTEM_PROMPT` is exported and already tuned, including the instruction to *skip* the tool on simple few-step tasks. Overriding it is the fastest way to make the agent ceremonious about trivia.
+- **Surface the channel.** The todo list is state, not just prompt scaffolding — that is the whole point of it surviving compaction. Ensure it is readable from the invoke result and from `stream`. For consumers shipping to end users, a live progress panel is worth more than the reasoning improvement; long agent runs feel broken when silent.
+- **Be honest in docs that it is advisory.** The model may not call it, and may write a plan then ignore it. Nothing enforces ordering or that a completed todo was actually done. A consumer who needs "the approved plan is followed, in order, with sign-off" has a planner-executor requirement that `planning: true` does not satisfy — that is a graph they build on LangGraph directly. Say so rather than letting them discover it.
+
+### Acceptance
+
+- `planning` omitted → middleware array identical to today's
+- `planning: true` → `write_todos` bound; todo prompt **appended** to the existing system prompt, not substituting it
+- Consumer tool named `write_todos` throws `AgentConfigError` / `TOOL_NAME_COLLISION` **at construction**, not at invoke
+- Todo state readable from result and stream; survives a checkpointed resume
+
+---
+
+## Phase 2 — Filesystem: memory that lives outside context
+
+The largest build and the highest-value capability. Two concerns kept strictly separate: **backend protocol** (storage) and **middleware** (tools + prompt).
+
+**Files:**
+```
+src/agents/capabilities/filesystem/
+  protocol.ts        # BackendProtocol: ls, read, write, edit, exists, delete
+  backends/state.ts  # default — state channel, ephemeral per thread
+  backends/store.ts  # BaseStore-backed, survives across threads
+  backends/node.ts   # real fs under a root, traversal-guarded
+  middleware.ts      # createMiddleware(...) exposing the four tools
+  prompt.ts          # usage instructions injected into system prompt
+```
+
+**Reserved names:** `ls`, `read_file`, `write_file`, `edit_file`
+
+### Implementation guidelines
+
+- **`protocol.ts` is an interface, not a class hierarchy.** Backends are plain objects satisfying it. This is what lets consumers supply their own later without the package growing a plugin system.
+- **`state` is the default.** No infrastructure, no persistence decision forced on the consumer.
+- **The node backend is a security boundary, not a convenience.** Resolve every path against `root` and reject anything escaping it *after* resolution — including `../`, absolute paths, and symlinks pointing outside. Anyone enabling this is handing an LLM a filesystem. `readOnly: true` makes writes return a tool error, not throw.
+- **`edit_file` is string-replace, not diff-apply.** Require the target substring to be unique; return an explicit tool error naming the ambiguity when it is not. Models recover from that error well. Silently editing the first match produces corruption that surfaces much later.
+- **`ls` output must be stably sorted.** Unstable ordering defeats prompt caching and makes tests flaky.
+- **Document the economics, because they are the selling point.** A 40k-token tool response sitting in message history is **re-billed on every subsequent turn**. Written to a file, one turn pays for the payload and the rest pay for a filename. On long runs this is most of the bill — it is not a nice-to-have.
+- **Note the second-order benefit in docs:** a run's output stops being a final message and becomes a set of artifacts the consumer can retrieve, diff, and display.
+
+### Acceptance
+
+- `filesystem` omitted → zero behavioural delta
+- One shared conformance suite written against `protocol.ts` passes for all three backends: write/read round trip, edit-uniqueness enforcement, `ls` ordering, delete-missing, read-missing
+- Node backend has a dedicated traversal-attack test file
+- State backend contents survive checkpointed resume within a thread and do **not** leak across threads
+- Collision check covers all four new names
+
+---
+
+## Phase 3 — Subagents: additional contexts running in parallel
+
+**Files:**
+```
+src/agents/capabilities/subagents/
+  middleware.ts   # the `task` tool
+  spawn.ts        # SubagentSpec -> child agent
+  prompt.ts       # delegation guidance for the parent
+```
+
+**Reserved names:** `task`
+
+### Implementation guidelines
+
+- **Build children with the same internal factory as the parent.** Recursion is the point — a child can have its own planning and filesystem. Cap depth (start at 3) and throw `SUBAGENT_DEPTH_EXCEEDED` at construction on deeper specs.
+- **Pass `name` to `createAgent` when spawning.** Post-upgrade, `createSubagentTransformer` keys off `lc_agent_name` to surface nested runs on `run.subagents` during streaming. Free observability, but only if children are named — and observability is the main thing consumers lose by delegating.
+- **Only the child's final message returns to the parent.** Intermediate messages must not enter parent state. That isolation *is* the capability. Test it explicitly rather than assuming it.
+- **Never give a child the `task` tool by default**, or two subagents will delegate to each other indefinitely.
+- **Filesystem inheritance:** `'inherit'` shares the parent's backend instance, `'isolated'` gives the child its own state backend, `false` gives it none. Default `'inherit'` when the parent has one.
+- **The `description` field is the number-one failure mode.** It is what the parent model sees when choosing. Vague description → parent never delegates, or delegates wrong. Document this loudly in JSDoc; it is a docs problem you own, not a code problem.
+- **Document the cost honestly:** delegation is serial round-trips (latency) and the parent loses sight of the child's reasoning (debuggability). The offsetting win is model-tier routing — grunt work on a cheap model, orchestration on the expensive one — where the per-token spread lets a subagent burn several times more tokens and still come out ahead.
+
+### Acceptance
+
+- `subagents` omitted → zero delta
+- Duplicate names, empty `description`, depth over cap each throw at construction
+- With a stubbed model: parent state after delegation gains **exactly one** message from the child, no child tool traffic
+- `'isolated'` child writes invisible to parent; `'inherit'` writes visible
+- Nested runs appear on `run.subagents` when streaming
+
+---
+
+## Phase 4 — Summarization & caching: compressing the context you have
+
+**Files:** `src/agents/capabilities/context.ts`
+
+### Implementation guidelines
+
+- **Ordering is load-bearing, not cosmetic.** Summarization must compose **after** filesystem, so detail is offloaded to files *before* compaction and the summary can point at a file instead of eating the content. Encode order in one function and add a test asserting composed order **by middleware name** — that test is what stops a future contributor quietly breaking it.
+- **Caching is switched on by model detection, not config**, and only for supported providers. Keep detection in one helper; it will need updating as the model surface moves. Post-upgrade both `anthropicPromptCachingMiddleware` and `bedrockPromptCachingMiddleware` are available.
+- **Frame the benefit as binary, not incremental.** Without summarization a long conversation hits the context limit and the run ends. With it, it runs indefinitely. That is the difference between the feature existing and not.
+- **Be candid that summarization is lossy in unpredictable ways** — something needed at turn 60 may have been compressed at turn 40. This is precisely why the filesystem ordering above matters, and why `deep` pairs the two.
+
+### Acceptance
+
+- `contextManagement` omitted → zero delta, **and no caching middleware added even on a supported model** (caching arrives only with the capability or the `deep` profile — this preserves invariant 1)
+- Composed-order test passes for all 16 combinations of the four capability flags
+
+---
+
+## Phase 5 — `deep` profile + documentation
+
+Sugar only. No new capability, no new code path.
+
+**Files:** `src/agents/profiles.ts`
+
+`profile: 'deep'` resolves to `{ planning: true, filesystem: 'state', contextManagement: true }`. Subagents stay opt-in — they change latency and debuggability enough that they should be a deliberate choice.
+
+**Explicit config always beats the preset.** `profile: 'deep', planning: false` disables planning, with a test proving it.
+
+**Ship the docs in this phase.** Phases 1–4 are inert without them. The README must lead with the two-tier framing and must state plainly: *if your agent finishes in under ~10 tool calls, `deep` will cost more and buy nothing.*
+
+---
+
+## Release sequence
+
+| Release | Contents | Consumer action |
+|---|---|---|
+| `x.y+1.0` | **Phase 0** — stack upgrade, peer ranges widened | consumers on old peers must bump |
+| `x.y+2.0` | Planning | none |
+| `x.y+3.0` | Filesystem | none |
+| `x.y+4.0` | Subagents | none |
+| `x.y+5.0` | Context management | none |
+| `x.y+6.0` | `deep` profile + docs | none |
+
+Phase 0 is the only release with a consumer-visible requirement, because peer ranges move. Phases 1–5 are additive minors. **If any of those five needs the word "migrate" in its changelog, it has violated the brief — rework rather than release.**
+
+---
+
+## Open question blocking prioritisation
+
+What do consuming teams actually build on this package?
+
+- **Mostly short runs** — a few internal APIs behind a chat interface: filesystem and subagents are dead weight. Planning is the only one that pays, mainly for the progress-UI benefit. Ship Phase 1, defer 2–3.
+- **Research, document processing, code/data migration**: filesystem is the headline and everything else supports it. Ship Phase 2 first after upgrade.
+
+The answer changes phase order and what the README leads with. Resolve before starting Phase 1.
