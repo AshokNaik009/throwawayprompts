@@ -1,0 +1,531 @@
+---
+version: alpha
+name: reInvent-Intel-Peak-deck-analysis
+description: A conference-keynote deck system (AWS re:Invent 2019, session AIM203-S — Intel × Peak × Footasylum). Two worlds sit side by side. Full-bleed "brand" slides ride the re:Invent diagonal gradient — a warm blue → magenta → orange → lavender wash cut by a hard diagonal seam — and carry the session code, section titles and partner logos. "Content" slides drop to a near-black warm charcoal canvas where a light-weight Amazon Ember headline tops icon rows, three-column comparisons and line charts. A tight, saturated accent set (mint, coral, cyan) codes a recurring three-part story — Context / Convenience / Control — while the Peak product diagrams add lime green, magenta, yellow and violet as system-layer colors. Everything is flat: no drop shadows, hairline dividers, big numerals.
+
+colors:
+  # re:Invent brand gradient stops (diagonal, top-left → bottom-right)
+  grad-blue: "#5B6FB5"
+  grad-violet: "#8A4F9E"
+  grad-magenta: "#C6478E"
+  grad-orange: "#F5A25D"
+  grad-peach: "#F6C89A"
+  grad-lavender: "#C9C6DE"
+
+  # Core surfaces
+  canvas-dark: "#242424"
+  canvas-darker: "#1A1A1A"
+  canvas-light: "#ffffff"
+  surface-navy: "#0C1B33"
+  surface-navy-soft: "#12233F"
+
+  # Text
+  ink-on-dark: "#ffffff"
+  ink-on-dark-soft: "#c7c7c7"
+  ink-on-dark-muted: "#8a8a8a"
+  ink-on-light: "#1a1a1a"
+  ink-on-light-soft: "#4a4a4a"
+  footer-legal: "#b8b8b8"
+
+  # The "three Cs" accent trio (also Marketing / Merch / Supply)
+  accent-mint: "#5FC9B5"      # Context · Customer AI · agenda numerals · subheads
+  accent-coral: "#F76B6B"     # Convenience · Demand AI · Merchandising
+  accent-cyan: "#29C7F5"      # Control · Supply AI · Supply chain
+
+  # Section-label chips (dark navy text on accent fill)
+  chip-context-bg: "#8FD9C9"
+  chip-convenience-bg: "#F79B93"
+  chip-control-bg: "#33D2F5"
+  chip-label-ink: "#0C1B33"
+
+  # Peak AI System diagram palette
+  peak-green-line: "#3DDC84"   # solution card borders (idle)
+  peak-green-fill: "#4CE664"   # solution cards (active/"activated")
+  peak-yellow: "#FFD400"       # AI Studio + AI Infrastructure layers
+  peak-magenta: "#EC1E79"      # Data Studio
+  peak-violet: "#A81CE0"       # Outcomes block
+  peak-blue-badge: "#4A5CC5"   # circular Peak logo lockup
+
+  # Data-viz
+  chart-pink: "#F52D8A"        # UK retail line
+  chart-yellow: "#FFD400"      # US retail line
+  chart-grid: "#4a4a4a"
+  chart-axis-label: "#9a9a9a"
+  stitch-green: "#3DDC84"      # decorative "stitched" accent under stats
+
+  # Stat-block fills (over photography)
+  stat-violet: "#A020F0"
+  stat-navy: "#0C1B33"
+
+  # Semantic (inferred, not heavily used)
+  success: "#3DDC84"
+  warning: "#FFD400"
+  error: "#F76B6B"
+
+typography:
+  session-code:
+    fontFamily: "'Amazon Ember', 'Ember', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+    fontSize: 18px
+    fontWeight: 700
+    lineHeight: 1.2
+    letterSpacing: 6px
+    textTransform: uppercase
+  display-hero:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 96px
+    fontWeight: 300
+    lineHeight: 1.05
+    letterSpacing: 0
+  display-title-slide:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 52px
+    fontWeight: 300
+    lineHeight: 1.15
+    letterSpacing: 0
+  display-section-bold:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 60px
+    fontWeight: 700
+    lineHeight: 1.05
+    letterSpacing: 0
+  heading-slide:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 40px
+    fontWeight: 300
+    lineHeight: 1.15
+    letterSpacing: 0
+  subhead-accent:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 22px
+    fontWeight: 400
+    lineHeight: 1.3
+    letterSpacing: 0
+  body-bullet:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 24px
+    fontWeight: 400
+    lineHeight: 1.4
+    letterSpacing: 0
+  body-caption-label:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 22px
+    fontWeight: 400
+    lineHeight: 1.35
+    letterSpacing: 0
+  emphasis-bold:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 24px
+    fontWeight: 700
+    lineHeight: 1.3
+    letterSpacing: 0
+  stat-numeral:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 120px
+    fontWeight: 700
+    lineHeight: 0.95
+    letterSpacing: -1px
+  stat-caption:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 26px
+    fontWeight: 400
+    lineHeight: 1.3
+    letterSpacing: 0
+  presenter-name:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 26px
+    fontWeight: 700
+    lineHeight: 1.2
+    letterSpacing: 0
+  presenter-role:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 22px
+    fontWeight: 300
+    lineHeight: 1.35
+    letterSpacing: 0
+  diagram-label:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 15px
+    fontWeight: 700
+    lineHeight: 1.2
+    letterSpacing: 0.3px
+  footer-legal:
+    fontFamily: "'Amazon Ember', sans-serif"
+    fontSize: 11px
+    fontWeight: 400
+    lineHeight: 1.3
+    letterSpacing: 0.2px
+
+rounded:
+  none: 0px
+  xs: 2px
+  sm: 4px
+  md: 8px
+  card: 6px
+  pill: 9999px
+  full: 9999px
+
+spacing:
+  xxs: 4px
+  xs: 8px
+  sm: 12px
+  md: 16px
+  lg: 24px
+  xl: 40px
+  xxl: 64px
+  slide-margin: 72px
+
+components:
+  slide-brand-gradient:
+    backgroundColor: "gradient(grad-blue → grad-magenta → grad-orange → grad-lavender)"
+    textColor: "{colors.ink-on-dark}"
+    typography: "{typography.display-section-bold}"
+    padding: "{spacing.slide-margin}"
+  slide-content-dark:
+    backgroundColor: "{colors.canvas-dark}"
+    textColor: "{colors.ink-on-dark}"
+    typography: "{typography.heading-slide}"
+    padding: "{spacing.slide-margin}"
+  slide-content-light:
+    backgroundColor: "{colors.canvas-light}"
+    textColor: "{colors.ink-on-light}"
+    typography: "{typography.heading-slide}"
+    padding: "{spacing.slide-margin}"
+  session-code-eyebrow:
+    backgroundColor: transparent
+    textColor: "{colors.ink-on-dark}"
+    typography: "{typography.session-code}"
+  slide-title:
+    backgroundColor: transparent
+    textColor: "{colors.ink-on-dark}"
+    typography: "{typography.heading-slide}"
+  slide-subhead:
+    backgroundColor: transparent
+    textColor: "{colors.accent-mint}"
+    typography: "{typography.subhead-accent}"
+  section-chip-context:
+    backgroundColor: "{colors.chip-context-bg}"
+    textColor: "{colors.chip-label-ink}"
+    typography: "{typography.emphasis-bold}"
+    rounded: "{rounded.none}"
+    padding: 16px 40px
+  section-chip-convenience:
+    backgroundColor: "{colors.chip-convenience-bg}"
+    textColor: "{colors.chip-label-ink}"
+    rounded: "{rounded.none}"
+  section-chip-control:
+    backgroundColor: "{colors.chip-control-bg}"
+    textColor: "{colors.chip-label-ink}"
+    rounded: "{rounded.none}"
+  agenda-numeral:
+    backgroundColor: transparent
+    textColor: "{colors.accent-mint}"
+    typography: "{typography.body-bullet}"
+  icon-triad-column:
+    backgroundColor: transparent
+    textColor: "{colors.ink-on-dark}"
+    typography: "{typography.body-caption-label}"
+  timeline-dot-connector:
+    backgroundColor: transparent
+    dotColors: "[accent-mint, accent-coral, accent-cyan]"
+    rounded: "{rounded.full}"
+  stat-numeral-block:
+    backgroundColor: transparent
+    textColor: "{colors.accent-mint}"
+    typography: "{typography.stat-numeral}"
+  stat-block-on-photo:
+    backgroundColor: "{colors.stat-violet}"
+    textColor: "{colors.ink-on-dark}"
+    typography: "{typography.stat-numeral}"
+    rounded: "{rounded.none}"
+    padding: "{spacing.lg}"
+  pipeline-flow-row:
+    backgroundColor: transparent
+    textColor: "{colors.ink-on-dark}"
+    typography: "{typography.body-caption-label}"
+  peak-system-frame:
+    backgroundColor: transparent
+    borderColor: "{colors.ink-on-dark}"
+    textColor: "{colors.ink-on-dark}"
+    typography: "{typography.diagram-label}"
+    rounded: "{rounded.none}"
+  peak-solution-card:
+    backgroundColor: transparent
+    borderColor: "{colors.peak-green-line}"
+    textColor: "{colors.ink-on-dark}"
+    rounded: "{rounded.none}"
+  peak-solution-card-active:
+    backgroundColor: "{colors.peak-green-fill}"
+    textColor: "{colors.ink-on-light}"
+    rounded: "{rounded.none}"
+  peak-layer-highlight:
+    backgroundColor: "{colors.peak-yellow}"
+    textColor: "{colors.ink-on-light}"
+    rounded: "{rounded.none}"
+  ui-mock-browser-frame:
+    backgroundColor: "#d9d9d9"
+    rounded: "{rounded.md}"
+  chart-line:
+    backgroundColor: transparent
+    strokeColors: "[chart-pink, chart-yellow]"
+    gridColor: "{colors.chart-grid}"
+  presenter-block:
+    backgroundColor: transparent
+    textColor: "{colors.ink-on-dark}"
+    typography: "{typography.presenter-name}"
+  partner-logo-lockup:
+    backgroundColor: transparent
+    textColor: "{colors.ink-on-dark}"
+    dividerColor: "{colors.ink-on-dark-soft}"
+  slide-footer:
+    backgroundColor: transparent
+    textColor: "{colors.footer-legal}"
+    typography: "{typography.footer-legal}"
+---
+
+## Overview
+
+This is a **conference-keynote system**, not a website — a 16:9 slide deck from AWS re:Invent 2019 (session **AIM203-S**), co-presented by Intel, Peak and Footasylum. It runs on **two alternating worlds** that give the deck its rhythm:
+
+1. **Brand slides** — full-bleed on the re:Invent **diagonal gradient** (`{colors.grad-blue}` → `{colors.grad-magenta}` → `{colors.grad-orange}` → `{colors.grad-lavender}`), sliced by a hard diagonal seam. These carry the session code, big section titles, partner logo lockups and the standard AWS footer. Used for the cover, every section divider, and the Q&A / Thank-you closers.
+2. **Content slides** — a warm near-black charcoal (`{colors.canvas-dark}`) with a **light-weight Amazon Ember** headline top-left and a flat body of icon rows, three-up comparisons, timelines and charts. A handful of "product screenshot" slides invert to white (`{colors.canvas-light}`).
+
+Type is **Amazon Ember** throughout, and the signature is the **weight contrast**: a thin 300 headline against 400 body, with 700 reserved for names, labels, stat numerals and the section-bold gradient titles.
+
+The deck tells one repeating story — **Context / Convenience / Control** — and hard-codes it into a **three-color accent system**: mint, coral, cyan. The same trio doubles as Marketing / Merchandising / Supply chain, and as the Customer AI / Demand AI / Supply AI product pillars. On top of that, the **Peak AI System diagrams** introduce a second palette (lime green, magenta, yellow, violet) that codes architecture *layers* rather than the narrative.
+
+**Key characteristics:**
+- Everything is **flat** — no drop shadows anywhere. Depth comes from the gradient, from full-bleed photography, and from color-block contrast.
+- **Light 300 headlines** set top-left, consistently, on every content slide.
+- The **Context/Convenience/Control** trio (mint/coral/cyan) is the connective tissue — carried by dots, chips, underlines and icon accents.
+- **Huge 700 numerals** (`28%`, `10x`, `+4%`, `30%`) are the primary "proof" device.
+- Section-divider slides always sit on the **re:Invent gradient**; content always drops to **charcoal**. The alternation is the pacing.
+- Icons are **thin single-weight line icons**, white on dark.
+- The **Peak logo** (P-E / A-K glyph) top-right marks every Peak-authored content slide; the **AWS smile + re:Invent logo** anchor gradient slides.
+
+## Colors
+
+### Brand gradient
+- **re:Invent gradient** — a diagonal multi-stop wash running `{colors.grad-blue}` (#5B6FB5) → `{colors.grad-violet}` → `{colors.grad-magenta}` (#C6478E) → `{colors.grad-orange}` (#F5A25D) → `{colors.grad-lavender}` (#C9C6DE), interrupted by a hard diagonal seam that offsets the two halves. This is the single most recognizable asset — reserve it for covers, section dividers and closers only.
+
+### Surfaces
+- **Canvas Dark** (`{colors.canvas-dark}` — #242424): the default content-slide background. Warm charcoal, not pure black.
+- **Canvas Darker** (`{colors.canvas-darker}` — #1A1A1A): full-bleed photo slides and the darkest content bands.
+- **Canvas Light** (`{colors.canvas-light}` — #ffffff): the "product screenshot" slides (Customer AI, Demand AI, Supply AI, Linking ML tech).
+- **Surface Navy** (`{colors.surface-navy}` — #0C1B33): dark-navy bars behind pillar labels (Customer AI / Demand AI / Supply AI) and the "50% higher margins" stat block.
+
+### The three Cs (the accent trio)
+- **Mint** (`{colors.accent-mint}` — #5FC9B5): **Context** · Customer AI · Marketing · agenda numerals · every accent subhead ("With customers", "An intelligence layer across the enterprise").
+- **Coral** (`{colors.accent-coral}` — #F76B6B): **Convenience** · Demand AI · Merchandising.
+- **Cyan** (`{colors.accent-cyan}` — #29C7F5): **Control** · Supply AI · Supply chain.
+
+These three appear as **timeline dots**, as the fill of the **section chips**, as icon-accent dots, and as the short colored **underlines** beneath in-practice icons.
+
+### Section-label chips
+Top-right chips on the pillar slides use a lightened accent fill with dark-navy text: `{colors.chip-context-bg}` / `{colors.chip-convenience-bg}` / `{colors.chip-control-bg}`, text in `{colors.chip-label-ink}` (#0C1B33), uppercase and letter-spaced.
+
+### Peak AI System palette (architecture layers)
+- **Peak Green** (`{colors.peak-green-line}` — #3DDC84 outline / `{colors.peak-green-fill}` — #4CE664 fill): the four solution cards; outlined when idle, filled when "activated."
+- **Yellow** (`{colors.peak-yellow}` — #FFD400): the **AI Studio** and **AI Infrastructure** horizontal layers when highlighted.
+- **Magenta** (`{colors.peak-magenta}` — #EC1E79): **Data Studio** (the odd-one-out card).
+- **Violet** (`{colors.peak-violet}` — #A81CE0): the **Outcomes** block at the top of the value stack.
+
+### Data-viz
+- **Chart Pink** (`{colors.chart-pink}` — #F52D8A): UK retail-sales line.
+- **Chart Yellow** (`{colors.chart-yellow}` — #FFD400): US retail-sales line.
+- **Grid** (`{colors.chart-grid}` — #4a4a4a) and **axis labels** (`{colors.chart-axis-label}` — #9a9a9a) stay quiet on the charcoal ground.
+
+### Text
+- **On Dark** (`{colors.ink-on-dark}` — #ffffff) for all headlines/body on charcoal; **On Dark Soft** (#c7c7c7) for secondary lines; **On Dark Muted** (#8a8a8a) for source notes.
+- **On Light** (`{colors.ink-on-light}` — #1a1a1a) on the white screenshot slides.
+- **Footer Legal** (`{colors.footer-legal}` — #b8b8b8): the "© 2019, Amazon Web Services…" line.
+
+## Typography
+
+### Font family
+The system runs **Amazon Ember** — the AWS corporate typeface — for everything. Fallback stack: `system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`.
+
+The weight split is the signature:
+- **Ember Light (300)** → all slide headlines, hero titles, presenter roles
+- **Ember Regular (400)** → body bullets, captions, subheads, footer
+- **Ember Bold (700)** → session code, section-divider titles, stat numerals, presenter names, diagram labels, emphasis lead-ins
+
+### Hierarchy
+
+| Token | Size | Weight | Tracking | Use |
+|---|---|---|---|---|
+| `{typography.display-hero}` | 96px | 300 | 0 | "Q&A", "Thank you!" giant covers |
+| `{typography.display-section-bold}` | 60px | 700 | 0 | Gradient section dividers ("The AI tech stack for retail", "AI Infrastructure", "AI Studio", "Peak solutions") |
+| `{typography.display-title-slide}` | 52px | 300 | 0 | Cover-slide title ("Take AI/ML from theory to practice…") |
+| `{typography.heading-slide}` | 40px | 300 | 0 | Every content-slide headline, top-left |
+| `{typography.stat-numeral}` | 120px | 700 | −1px | Big proof numbers ("28%", "10x", "30%", "+4%") |
+| `{typography.stat-caption}` | 26px | 400 | 0 | Line under a stat ("Uplift in email revenue") |
+| `{typography.presenter-name}` | 26px | 700 | 0 | "Richard Potter", "Tom Summerfield" |
+| `{typography.presenter-role}` | 22px | 300 | 0 | "CEO / Peak", role + org lines |
+| `{typography.subhead-accent}` | 22px | 400 | 0 | Mint accent subheads under a title |
+| `{typography.body-bullet}` | 24px | 400 | 0 | Agenda items, bullet body |
+| `{typography.body-caption-label}` | 22px | 400 | 0 | Icon-row captions ("Context", "Convenience"…) |
+| `{typography.session-code}` | 18px | 700 | 6px | "A I M 2 0 3 - S" eyebrow |
+| `{typography.diagram-label}` | 15px | 700 | 0.3px | "Customer AI", "AI Studio", box labels |
+| `{typography.footer-legal}` | 11px | 400 | 0.2px | Copyright footer |
+
+### Principles
+- **Light headline, regular body, bold numerals** — the three-weight rhythm is fixed. Avoid medium (500); it isn't in the system.
+- **Wide-tracked uppercase** is reserved for the **session code** (6px) and the **section chips** — the "conference badge" voice.
+- Titles **always sit top-left** on content slides; gradient-divider titles sit **left-center**.
+- **Numerals do the persuading.** When there's a metric, it's set enormous in 700 with a small regular caption beneath and a thin rule.
+
+### Note on font substitutes
+Amazon Ember is licensed to Amazon and not freely distributable. Close open-source stand-ins:
+- **Inter** — near match; run 300 / 400 / 700 and leave tracking at 0.
+- **Ember-alikes**: "Public Sans" or "Source Sans 3" for a slightly warmer body.
+- Keep the **Light/Regular/Bold** trio and the wide-tracked uppercase eyebrow to preserve the feel.
+
+## Layout
+
+### Canvas & margins
+- **Frame:** 16:9 (1280×720 / 1920×1080).
+- **Slide margin:** ~`{spacing.slide-margin}` (72px) on content slides; title sits in the top-left corner within that margin.
+- **Base unit:** 8px; steps `{spacing.xxs}` 4 · `{spacing.xs}` 8 · `{spacing.sm}` 12 · `{spacing.md}` 16 · `{spacing.lg}` 24 · `{spacing.xl}` 40 · `{spacing.xxl}` 64.
+
+### Recurring layouts
+- **Title top-left + content below/right** — the default content slide.
+- **Split slide** — text left on charcoal, product screenshot right on white (We are Footasylum, The Peak AI System).
+- **Three-up icon triad** — three centered columns, icon → thin colored rule → caption. The mint/coral/cyan trio colors the rule or the dot.
+- **Timeline row** — three icons across the top, dropped stems to a dotted horizontal line, mint/coral/cyan dots at each node ("Connected retail isn't easy").
+- **Prediction + Optimization = Profitability** — the pillar slides: data-cloud icons far left → product UI mock → a bracketed list of capabilities → an "=" → an outcomes list. A colored section chip pins the top-right.
+- **Left value-stack ↔ right system diagram** — the Peak "Outcomes / Solutions / Workflow / Infrastructure / Data" stack mirrored against the boxed AI System architecture.
+- **Gradient divider** — full-bleed gradient, big 700 title left-center, partner logos top-left, AWS + re:Invent marks bottom corners.
+
+### Whitespace philosophy
+Content slides are **generous and airy** — one idea per slide, a lot of charcoal breathing room around a single triad or diagram. The density only rises inside the **product UI screenshots** and the **Peak architecture diagram**, which are intentionally detailed.
+
+## Elevation & Depth
+
+| Level | Treatment | Use |
+|---|---|---|
+| Flat | No shadow, no border | Titles, body, icon rows, timelines |
+| Gradient field | Full-bleed re:Invent gradient | Covers, dividers, closers |
+| Full-bleed photo | Edge-to-edge imagery (storefront, city, crowd) | Chapter openers, "Delivering connected retail" |
+| Color block | Solid mint/coral/cyan chip or violet/navy stat block over photo | Section labels, proof numbers |
+| Outline box | 1px white/green/yellow stroke | Peak AI System architecture frame + cards |
+| Faux UI card | Light-grey browser chrome, `{rounded.md}` | Product screenshots (AI System login, Workflow, dashboards) |
+
+The deck **never uses a drop shadow.** Depth is entirely gradient + photography + color-block contrast + the occasional 1px outline.
+
+### Decorative accents
+- **Stitched / hatch texture** — a small green cross-hatch (`{colors.stitch-green}`) tucked under stat blocks and beside Peak flow steps.
+- **Dotted connector lines** — thin dotted rules link timeline nodes and pipeline steps.
+- **Concentric ring motif** — dashed rings radiating from a phone on the closing "connected retail" photo slide.
+
+## Shapes
+
+### Corner radius
+
+| Token | Value | Use |
+|---|---|---|
+| `{rounded.none}` | 0px | Section chips, stat blocks, Peak architecture boxes, pillar-label navy bars — the dominant radius |
+| `{rounded.card}` | 6px | Faux browser UI window corners |
+| `{rounded.md}` | 8px | UI mock frames, rare rounded panels |
+| `{rounded.full}` | 50% | Timeline dots, numbered circles, icon-accent dots, the round Peak logo badge |
+
+The radius logic is **binary**, like BMW's: **rectangular for every box and chip; circular only for dots, numbered markers and the Peak badge.** UI screenshots are the one place softer corners appear.
+
+### Photography geometry
+- Full-bleed 16:9 chapter photos (storefronts, crowds, city skyline).
+- **Skewed/parallelogram photo tiles** — the "Retailers need to be better connected" images are cut on a slight 3D skew, each pinned with a numbered mint/coral/cyan circle.
+- Circular photo crops (paired overlapping circles on "We are Footasylum") with a green connective shape between them.
+
+## Components
+
+### Session-code eyebrow
+**`session-code-eyebrow`** — the "A I M 2 0 3 - S" label. `{typography.session-code}` (18px / 700 / **6px tracking**, uppercase), white, top-left above the title on cover and divider slides.
+
+### Titles & subheads
+**`slide-title`** — top-left, `{typography.heading-slide}` (40px / 300), white on charcoal.
+**`slide-subhead`** — the mint accent line beneath it, `{typography.subhead-accent}` (22px / 400) in `{colors.accent-mint}` ("With customers", "… and internally too", "An intelligence layer across the enterprise").
+
+### Section chips
+**`section-chip-context` / `-convenience` / `-control`** — top-right rectangular chips (0px radius) on the pillar slides. Fill is the lightened accent (`chip-*-bg`), text is dark navy `{colors.chip-label-ink}`, uppercase bold. These name which of the three Cs the slide belongs to.
+
+### Agenda list
+**`agenda-numeral`** — numbers `1.`–`7.` in `{colors.accent-mint}`, items in white `{typography.body-bullet}`, generous line spacing, paired with a full-bleed skewed photo on the right half.
+
+### Icon triads
+**`icon-triad-column`** — three centered columns: thin white line icon → short colored rule (`accent-mint` / `accent-coral` / `accent-cyan`, or grey) → caption in `{typography.body-caption-label}`. Used on "MLOps in a box", "Enterprise-grade security", "in practice" slides.
+
+### Timeline / pipeline
+**`timeline-dot-connector`** — icons across the top, thin stems dropping to a **dotted horizontal line**, with the mint/coral/cyan **dots** at each node. Bold captions below, colored metric sub-captions ("1m+ consumers", "25k products", "Omnichannel fulfillment").
+**`pipeline-flow-row`** — left-to-right flow of tech marks (streaming → Apache Spark → S3/Redshift → AI/ML gear) joined by dotted separators, each with a stem-and-tick and a caption.
+
+### Stat blocks
+**`stat-numeral-block`** — a giant `{typography.stat-numeral}` (120px / 700) in `{colors.accent-mint}` with a small regular caption and a thin white rule beneath ("28% — Uplift in email revenue", "10x — Return on Ad spend").
+**`stat-block-on-photo`** — over the NYC skyline, solid **violet** (`{colors.stat-violet}`) and **navy** (`{colors.stat-navy}`) rectangles hold "30% faster" / "50% higher profit margins" in white.
+
+### Peak AI System diagram
+**`peak-system-frame`** — an outlined "AI System" box containing a top row of four cards + two full-width layer bars, wired below to a dashed "Systems of record / engagement / Data warehouse" group.
+**`peak-solution-card`** / **`-active`** — the four cards (Customer AI, Demand AI, Supply AI, Data Studio). Idle = thin outline (green for the three AIs, magenta for Data Studio); active = **filled** green / magenta with dark text. Progressive slides light these up step by step.
+**`peak-layer-highlight`** — the **AI Studio** and **AI Infrastructure** bars flip to solid **yellow** (`{colors.peak-yellow}`) to spotlight that layer in the numbered walkthrough (1 → 2 → 3).
+Left mirror stack: **Outcomes** (violet) / Solutions (green) / Workflow / Infrastructure / Data, connected by UML-style ball-and-socket connectors.
+
+### Product UI mocks
+**`ui-mock-browser-frame`** — light-grey browser chrome with traffic-light dots and a `{rounded.md}` window, holding real-looking Peak screens (login, workflow DAG, Customer AI dashboard with metric tiles and bar charts). Charts inside use magenta / navy / violet bars and a green trend line.
+
+### Charts
+**`chart-line`** — dual line charts on charcoal: **pink** UK line + **yellow** US line, quiet grey grid and axis labels, a bold accent metric callout beside each ("+4% YoY growth" in pink, "+3%" in yellow) and a muted source note.
+
+### Presenter block & logo lockup
+**`presenter-block`** — name in `{typography.presenter-name}` (26px / 700), role + org in `{typography.presenter-role}` (300). Two side-by-side on shared-title slides.
+**`partner-logo-lockup`** — white partner logos separated by a thin vertical `{colors.ink-on-dark-soft}` divider (PEAK | aws | intel), top area of gradient dividers.
+
+### Footer
+**`slide-footer`** — centered "© 2019, Amazon Web Services, Inc. or its affiliates. All rights reserved." in `{typography.footer-legal}`, flanked by the re:Invent mark (bottom-left) and AWS smile (bottom-right) on gradient slides.
+
+## Do's and Don'ts
+
+### Do
+- Reserve the **re:Invent gradient** for covers, section dividers and closers; drop to `{colors.canvas-dark}` charcoal for all content.
+- Keep the **Context = mint / Convenience = coral / Control = cyan** mapping consistent everywhere — dots, chips, underlines, icon accents.
+- Set headlines in **Ember Light 300, top-left**; body in Regular 400; reserve 700 for numerals, names, chips and diagram labels.
+- Make metrics **huge** (120px, 700) with a small caption and a thin rule — the deck's core proof device.
+- Keep icons **thin, single-weight, white** on dark.
+- Light up the **Peak diagram layer by layer** (green cards, yellow Studio/Infra, magenta Data Studio, violet Outcomes) to walk the architecture.
+- Mark Peak content slides with the **PEAK glyph top-right**; mark gradient slides with **AWS + re:Invent**.
+
+### Don't
+- Don't add drop shadows — the system is flat; depth is gradient + photo + color block.
+- Don't introduce a fourth "narrative" accent beyond mint/coral/cyan; the Peak green/yellow/magenta/violet set is for **architecture layers only**, not the three-Cs story.
+- Don't set headlines bold — 300 Light is the headline voice; bold is for numerals and labels.
+- Don't center body content — titles and copy anchor **top-left / left**.
+- Don't run two gradient slides back-to-back for content; gradient is punctuation, charcoal is the body.
+- Don't tighten tracking on body; save wide letter-spacing for the **session code** and **chips**.
+- Don't recolor the section chips off their C — Context stays mint, Convenience coral, Control cyan.
+
+## Slide Inventory (reference map)
+
+| Slide | World | Signature element |
+|---|---|---|
+| Cover / speaker titles | Gradient | Session code + light title + partner logos |
+| Agenda | Charcoal | Mint numerals + skewed photo right |
+| "It's not all doom and gloom" | Charcoal | Dual pink/yellow line charts + big % callouts |
+| "30% / 50%" | Photo | Violet + navy stat blocks over skyline |
+| Retailers need to be better connected | Charcoal | Skewed photo tiles + numbered mint/coral/cyan circles + timeline |
+| Connected retail isn't easy | Charcoal | Icon timeline with three-C dots + colored metrics |
+| The AI tech stack for retail | Gradient | 700 bold divider title, PEAK\|aws\|intel lockup |
+| Built to deliver outcomes | Charcoal | Three-tier layered ribbon (Peak / AWS / Intel) |
+| Peak AI System (1–3) | Charcoal | Architecture box, progressive green/yellow/magenta lighting |
+| AI Infrastructure / AI Studio / Peak solutions | Gradient | Divider with faded architecture diagram, one layer highlighted |
+| Customer / Demand / Supply AI | White | Prediction + Optimization = Profitability, colored C-chip |
+| Footasylum "Rapid time to value" | Photo | 28% / 10x mint stat blocks on green store photo |
+| "…in practice" slides | Charcoal | Three-up icon triad, colored rules |
+| Delivering connected retail | Photo | Concentric ring motif, bold "Driven by AI" |
+| Customer logo wall | Charcoal | Grid of brand logos, diagonal charcoal corners |
+| The only AI stack | Charcoal | PEAK\|aws\|intel + boxed value line + CTA URL |
+| Q&A / Thank you | Gradient | Giant 96px Light cover + contact emails |
+
+## Known Gaps
+- **Amazon Ember** and **Peak's** brand fonts/marks are proprietary; Inter (300/400/700) is the documented substitute.
+- Exact gradient stop positions and the diagonal seam angle are approximate — sampled visually, not from source vectors.
+- Hex values are eyedropped from rendered slides; treat them as close matches, not brand-exact tokens.
+- Animation/build order (the card-by-card Peak diagram reveals) is inferred from the static sequence; timing is out of scope.
+- Semantic colors (success/warning/error) are inferred from the accent set — the deck doesn't use explicit form/UI states.
+- The product UI screenshots imply a separate Peak web-app design language (light theme, its own component set) that isn't fully captured here.
