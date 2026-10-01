@@ -1,0 +1,458 @@
+Remedy → Mongo → PWA Real-Time Sync: Implementation Spec
+Sep 19, 2026 · @Ashok Naik
+Handoff specification for a coding agent. Node.js only — no changes to BMC Remedy, no DBA-owned tooling.
+1. Context and goal
+What exists today. ENBD tracks P1–P4 incidents in BMC Remedy, backed by an old Oracle database. A Node.js service reads from Oracle, writes to MongoDB, and serves a PWA. The current sync runs hourly.
+Problem with the current design. Hourly polling gives neither freshness nor safety. A P1 raised at 10:01 surfaces at 11:00, and a strict modified > watermark comparison can permanently drop tickets whose Remedy transaction commits after the poll ran. The second failure is silent — no error, no gap in the logs.
+What we are building. A near-real-time P1/P2 pipeline that lives entirely in Node.js. No Remedy filter changes, no GoldenGate, no Debezium, no DBA-owned tooling, no schema changes in Remedy. The only things asked of the Remedy/Oracle owners are a read-only account and confirmation of an index.
+Definition of done.
+• A P1 or P2 created or updated in Remedy is visible in the PWA within 60 seconds (target: 30s median).
+• A P1 reaches an on-call engineer whose PWA is closed or backgrounded, via Web Push.
+• Oracle load is lower than the current hourly job, measured in logical reads per hour.
+• Zero silent drops: no ticket meeting the P1/P2 filter can fail to appear without an alert firing.
+• The pipeline survives a pod restart, a Mongo failover, and an Oracle outage without data loss or duplicate notifications.
+2. Architecture
+Oracle (BMC Remedy)
+   │  ① adaptive watermark poll — node-oracledb, read-only user, 30–60s
+   ▼
+Ingestion worker (Node)  ← only the leader polls; lease held in Mongo
+   │  ② idempotent bulkWrite upsert, monotonic guard
+   ▼
+MongoDB (replica set)
+   │  ③ change stream, filtered to P1/P2, resume token persisted
+   ▼
+API pods (Node, N replicas)
+   │  ④ SSE per user + ⑤ Web Push for P1
+   ▼
+PWA
+Why this shape. Mongo change streams replace a message broker, so there is no Kafka or Redis to operate. SSE replaces WebSockets because the incident feed is one-way and SSE reconnects and replays natively. The leader lease keeps N pods from becoming N pollers against Remedy's database.
+Services to build.
+#
+Service
+Responsibility
+Scale
+1
+poller
+Watermark query against Oracle, upsert to Mongo
+1 active (leader), N standby
+2
+reconciler
+Periodic full-key sweep for deletes and late edits
+runs inside poller on its own timer
+3
+api
+SSE endpoint, REST reads, Web Push dispatch
+N replicas, stateless
+Services 1 and 2 can ship as one process with two timers. Service 3 must be separate so a poller restart never drops client connections.
+3. Pre-build verification (do this first)
+The field IDs below are BMC defaults. ENBD's instance may be customised, and building on unverified IDs is the most likely way this project ships broken. Confirm every row before writing poller code. Record the answers in a remedy-schema.md in the repo.
+Assumption
+How to verify
+If wrong
+Form is HPD:Help Desk
+SELECT name, schemaId FROM arschema WHERE name LIKE 'HPD%'
+Use the actual form name; note its schemaId for the T<id> table
+C1 = Request ID
+SELECT fieldId, fieldName FROM field WHERE schemaId = :id AND fieldId < 20
+Map to whatever column holds the incident number
+C6 = Modified Date
+Same query; confirm it reads as Modified Date, not Last Modified By
+Use the correct column — this is the watermark column
+C6 is NUMBER (epoch seconds)
+DESC "HPD:Help Desk" on the view
+If DATE, swap integer maths for INTERVAL '5' MINUTE
+Priority field ID (BMC default 1000000164)
+SELECT fieldId, fieldName FROM field WHERE schemaId = :id AND fieldName LIKE '%Priority%'
+Use the real ID
+Priority values: 0=Critical, 1=High
+SELECT DISTINCT C<priorityId>, COUNT(*) FROM ... GROUP BY and cross-check against the UI
+Adjust the IN list
+Status field C7 and its open/closed values
+Same approach
+Adjust the open-status filter
+An index exists on C6
+SELECT index_name, column_name FROM user_ind_columns WHERE table_name = ...
+Stop and request one. Without it every poll is a full scan and the whole plan fails
+The query uses that index
+EXPLAIN PLAN — must show INDEX RANGE SCAN, not TABLE ACCESS FULL
+Rework the predicate, or request a composite index on (C6, priority)
+A view exists for the form
+Query it rather than T<schemaId>
+Fall back to the T-table, but document the schemaId
+Also capture a baseline before any change: logical reads, elapsed time, and rows returned for one run of the existing hourly job. You will need this to prove to the DBA team that 30-second polling is lighter, not heavier.
+Measure the commit lag. Run SELECT MAX(C6), SYSDATE FROM ... repeatedly for an hour during a busy period and record how far behind wall-clock the max modified-date sits. That observed lag, plus margin, sets OVERLAP_SEC in section 10. Do not guess it.
+4. Component 1 — the Oracle watermark poller
+What a watermark is
+A single integer stored in Mongo, not Oracle. Oracle has no concept of it. It holds the highest C6 (Modified Date) value the poller has ever seen. Each cycle asks Oracle only for rows at or above that mark, so a typical poll returns zero rows and costs almost nothing. Frequency controls freshness; the watermark controls cost. They are independent knobs and the design needs both.
+Four rules that must not be broken
+These exist because each one, violated, causes a silent loss of a P1. Treat them as non-negotiable and cover each with a test in section 13.
+1. Query >= watermark - OVERLAP_SEC, never > watermark. Remedy stamps Modified Date when the field is set, but the transaction commits later. A row stamped 10:00:00 that commits at 10:00:04 is invisible to a poll at 10:00:02 that then stores a watermark of 10:00:01 — and a strict > excludes it forever. The overlap re-reads that window every cycle.
+2. Derive the new watermark from MAX(C6) of rows Oracle returned — never Date.now(). The Node host clock and the Oracle host clock are different clocks. Using local time manufactures the same gap by hand.
+3. Persist the watermark only after the Mongo writes commit. Writing it first turns a crash into permanent data loss: the rows were never stored but the bookmark says they were.
+4. If the result set is empty, leave the watermark untouched. Do not advance it to "now" — rows may be mid-commit in that window.
+Reference implementation
+const OVERLAP_SEC = 300; // must exceed observed commit lag (section 3)
+
+async function pollOnce(conn, db) {
+  const state = db.collection('sync_state');
+  let doc = await state.findOne({ _id: 'hpd_helpdesk' });
+
+  // Cold start: no bookmark yet
+  if (!doc) {
+    const from = Math.floor(Date.now() / 1000) - (BACKFILL_DAYS * 86400);
+    await state.insertOne({ _id: 'hpd_helpdesk', watermark: from });
+    doc = { watermark: from };
+  }
+
+  const lower = doc.watermark - OVERLAP_SEC;
+
+  const rs = await conn.execute(
+    `SELECT C1, C6, C7, C1000000164, C1000000000, C1000000063, C1000000217
+       FROM "HPD:Help Desk"
+      WHERE C6 >= :lower
+        AND C1000000164 IN (0, 1)`,
+    { lower },
+    { outFormat: oracledb.OUT_FORMAT_OBJECT, fetchArraySize: 500 }
+  );
+
+  if (rs.rows.length === 0) return { rows: 0 };   // rule 4
+
+  await upsertIncidents(db, rs.rows);              // must fully commit first
+
+  const maxTs = rs.rows.reduce((m, r) => Math.max(m, r.C6), doc.watermark); // rule 2
+  await state.updateOne(                            // rule 3 — last
+    { _id: 'hpd_helpdesk' },
+    { $set: { watermark: maxTs, lastPollAt: new Date(), lastRows: rs.rows.length } }
+  );
+
+  return { rows: rs.rows.length, watermark: maxTs };
+}
+Oracle client settings
+• Pool poolMin: 1, poolMax: 2. The poller runs one query at a time and needs one connection; the spare covers the reconciler. A large pool adds idle sessions to someone else's production database for no benefit. If a bigger pool ever looks necessary, the query is slow and needs an index — not more connections.
+• Bind variables always (:lower), so Oracle reuses the cursor instead of flooding the shared pool with hard parses.
+• callTimeout of ~15s, so a stuck query cannot pile up connections.
+• Project only the columns needed. No SELECT *.
+• oracledb.thin mode unless CQN is added later (thick mode required for CQN).
+Adaptive interval
+Condition
+Next interval
+Last poll returned rows
+5s (bursts cluster)
+Business hours, no rows
+30s
+Outside business hours
+120s
+Consecutive Oracle errors
+exponential backoff to 5 min, then alert
+Optional: Oracle CQN as a "poll now" trigger
+node-oracledb supports Continuous Query Notification: open the connection with events: true, call connection.subscribe() with a query and a callback, and the callback fires when a matching change commits. Do not make this the data path. Oracle's own guidance is that high-churn tables are better served by polling, and the Help Desk table is high-churn. It also needs a GRANT CHANGE NOTIFICATION and an inbound port from the database to the app host, plus re-registration handling after a DB restart.
+If pursued at all, use it only to wake the poll loop early. The system must be fully correct with CQN disabled.
+5. Component 2 — leader election
+If every pod polls, N pods means N times the Oracle load, which is exactly what this design set out to avoid. One leader polls; the rest stand by and take over within 30 seconds of a leader dying.
+A Mongo lease is sufficient. Do not add ZooKeeper, etcd, or Redis for this.
+const LEASE_MS = 30_000;
+
+async function tryAcquireLease(db) {
+  const now = new Date();
+  const res = await db.collection('locks').findOneAndUpdate(
+    { _id: 'oracle-poller',
+      $or: [{ expiresAt: { $lt: now } }, { owner: POD_ID }] },
+    { $set: { owner: POD_ID, expiresAt: new Date(Date.now() + LEASE_MS) } },
+    { upsert: true, returnDocument: 'after' }
+  );
+  return res?.owner === POD_ID;
+}
+Requirements.
+• Renew the lease every LEASE_MS / 3. A leader that fails to renew must stop polling immediately, before the lease expires, so two pods never poll at once.
+• The $or clause lets the current holder renew while blocking everyone else.
+• Handle the upsert duplicate-key race: on E11000, treat it as losing the election and retry next tick.
+• Expose leadership state on /health so it is visible which pod is active.
+• On graceful shutdown (SIGTERM), release the lease by setting expiresAt to now, so failover is instant rather than 30 seconds.
+6. Component 3 — MongoDB schema and idempotent upsert
+Collections
+// incidents — one document per ticket
+{
+  _id: "INC000001234",        // Remedy C1, the natural key
+  sourceTs: 1758276000,        // C6, epoch seconds — the monotonic guard
+  priority: 0,                 // 0 = Critical (P1), 1 = High (P2)
+  status: 1,
+  summary: "Core banking API latency",
+  assignedGroup: "Payments L2",
+  submitDate: 1758270000,
+  lastSyncedAt: ISODate(),
+  seenInSweepAt: ISODate()     // set by the reconciler, section 9
+}
+
+// sync_state — the watermark and poller telemetry
+{ _id: "hpd_helpdesk", watermark: 1758276000, lastPollAt: ISODate(),
+  lastRows: 0, lastError: null, consecutiveErrors: 0 }
+
+// locks — leader lease
+{ _id: "oracle-poller", owner: "pod-7f3a", expiresAt: ISODate() }
+
+// stream_state — change-stream resume token
+{ _id: "sse-fanout", resumeToken: {}, updatedAt: ISODate() }
+
+// push_subscriptions — Web Push endpoints, section 8
+{ _id: ObjectId(), userId: "...", endpoint: "...", keys: {},
+  createdAt: ISODate(), failureCount: 0 }
+Indexes
+db.incidents.createIndex({ priority: 1, status: 1, sourceTs: -1 });
+db.incidents.createIndex({ seenInSweepAt: 1 });
+db.push_subscriptions.createIndex({ userId: 1 });
+The idempotent upsert
+The overlap window means the same row is read several times. That must be harmless. The $lt guard makes a re-read a no-op and, more importantly, stops an out-of-order arrival from overwriting newer state.
+async function upsertIncidents(db, rows) {
+  const ops = rows.map(r => ({
+    updateOne: {
+      filter: { _id: r.C1, sourceTs: { $lt: r.C6 } },
+      update: { $set: mapIncident(r), $setOnInsert: { firstSeenAt: new Date() } },
+      upsert: true
+    }
+  }));
+  await db.collection('incidents').bulkWrite(ops, { ordered: false });
+}
+Wrinkle the agent must handle. An upsert whose filter includes sourceTs: { $lt: ... } will attempt an insert when the document exists but the guard fails, producing a duplicate-key error on _id. With ordered: false the rest of the batch still applies. Catch the BulkWriteError, filter out code 11000, and treat those as successful no-ops. Any other error must fail the cycle so the watermark does not advance.
+A replica set is required — change streams do not work against a standalone mongod. Confirm the target environment before starting.
+7. Component 4 — change stream to SSE fan-out
+Why SSE and not WebSockets
+The incident feed is one-way: server to client, and the client never pushes back over the same channel. SSE runs over ordinary HTTP, so it passes through the bank's proxies and load balancers with no upgrade handling, reconnects automatically, and supports replay natively via Last-Event-ID. WebSockets would add heartbeats, reconnection code, sticky routing, and LB configuration for a capability nothing here uses.
+If the PWA later needs to write back to Remedy (acknowledge, assign, add a work note), that is a REST call, not a reason to switch transports.
+Each API pod watches the collection
+const pipeline = [{
+  $match: {
+    'fullDocument.priority': { $in: [0, 1] },
+    operationType: { $in: ['insert', 'update', 'replace'] }
+  }
+}];
+
+const stream = db.collection('incidents').watch(pipeline, {
+  fullDocument: 'updateLookup',
+  resumeAfter: savedToken   // omit on first ever start
+});
+
+for await (const change of stream) {
+  enqueue(change.fullDocument);
+  await saveResumeToken(change._id);
+}
+Resume handling. Persist the token after each batch. On reconnect, pass resumeAfter. If Mongo rejects the token because the oplog has rolled past it, fall back to a full reload of open P1/P2 documents and log it as a degraded restart.
+Batching
+Do not emit one SSE frame per change. Coalesce into a 250ms window and send one frame containing the batch. A bulk update in Remedy — a mass reprioritisation, a bulk close — can produce hundreds of changes in a second, and per-row frames will saturate slow mobile connections. Discord's engineering write-ups make the same point: they built a batched event dispatcher specifically to cut fan-out cost.
+Also: do not hold the full incident set in memory in every pod. Discord's first relay design kept a full copy of the member list in each relay and it wasted large amounts of memory and slowed startup; the fix was giving each relay only what it used. Each pod here should hold only the connections it serves and the deltas passing through.
+SSE endpoint
+app.get('/api/stream', authenticate, (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'        // required behind nginx
+  });
+
+  const since = req.headers['last-event-id'];
+  if (since) replaySince(res, since);
+
+  registry.add(req.user.id, res);
+  const hb = setInterval(() => res.write(': hb\n\n'), 15000);
+  req.on('close', () => { clearInterval(hb); registry.remove(req.user.id, res); });
+});
+Requirements.
+• Every event carries a monotonic id: so Last-Event-ID replay works. Use the incident's sourceTs plus a sequence, or a server-side counter persisted in Mongo.
+• Heartbeat comment every 15s, or intermediate proxies will close idle connections.
+• X-Accel-Buffering: no and no-transform, or nginx buffers the stream and nothing arrives until the buffer fills.
+• Cap connections per user (2–3) so a reconnect loop cannot exhaust file descriptors.
+• Backpressure: if res.write() returns false, drop the oldest queued events for that client rather than growing the buffer without bound.
+• On pod shutdown, send a retry: hint and close cleanly so clients reconnect on a stagger rather than all at once.
+8. Component 5 — Web Push for P1
+SSE only reaches an open tab. The actual business requirement behind "real-time P1 alerting" is reaching an on-call engineer whose phone is in their pocket. That needs the Web Push API and a service worker.
+Scope. P1 only. P2 goes to the SSE feed and the in-app badge. Pushing every P2 trains people to dismiss notifications, and then the P1 gets dismissed too.
+Implementation.
+• web-push npm package, VAPID keys in the secret store (never in the repo, never in client bundles).
+• Service worker handles push and notificationclick; clicking opens the PWA deep-linked to that incident.
+• Subscriptions stored per user; a 410 Gone or 404 from the push service means the subscription is dead — delete it rather than retrying.
+• Track failureCount and prune after repeated failures.
+Deduplication is mandatory. A single P1 can be modified a dozen times in its first ten minutes. Push once per incident on the transition into P1 (or on creation at P1), then suppress further pushes for that incident for a cooldown window (default 30 minutes), unless the status changes to resolved. Without this the pipeline becomes a pager storm and the feature gets turned off.
+Keep the payload minimal: incident number, priority, a short summary, and the deep link. Push payloads travel through Google's and Mozilla's infrastructure — see section 12.
+9. Component 6 — reconciliation sweep
+The watermark poll has two blind spots it can never cover on its own, and both are cheap to close because the open P1/P2 set is small — typically a few hundred rows.
+Blind spot 1: hard deletes. A delta on a modified-date column cannot observe a row that was physically removed. Deleted or merged tickets would linger in Mongo forever.
+Blind spot 2: edits older than the overlap window. A back-dated correction, a data fix, or a restore can land with a modified date well below watermark - OVERLAP_SEC. The overlap re-scan will not see it.
+The sweep. Every 15 minutes, on the leader:
+// 1. Pull the full current key set — IDs and timestamps only, no wide columns
+const rs = await conn.execute(
+  `SELECT C1, C6 FROM "HPD:Help Desk"
+    WHERE C1000000164 IN (0,1) AND C7 IN (0,1,2,3)`   // open statuses
+);
+
+// 2. Mark everything seen
+await db.collection('incidents').updateMany(
+  { _id: { $in: rs.rows.map(r => r.C1) } },
+  { $set: { seenInSweepAt: now } }
+);
+
+// 3. Anything open in Mongo but absent from Oracle is stale — reap it
+const stale = await db.collection('incidents').find({
+  status: { $in: OPEN_STATUSES },
+  seenInSweepAt: { $lt: new Date(now - 2 * SWEEP_INTERVAL) }
+}).toArray();
+
+// 4. Any row whose Oracle C6 differs from Mongo sourceTs was missed — re-fetch it
+Step 4 is the important one: it is the only mechanism that catches a genuinely dropped ticket. Count the mismatches and emit them as a metric. A non-zero value means the watermark logic has a hole — most likely OVERLAP_SEC is smaller than the real commit lag. This metric is the early warning that the pipeline is losing data, and it should alert.
+The sweep query touches two columns across a few hundred rows. It is not a full-table scan and does not need to run outside business hours.
+10. Configuration
+Everything tunable lives in environment variables. No magic numbers in code.
+Variable
+Default
+Rationale
+ORACLE_POOL_MIN
+1
+One query at a time
+ORACLE_POOL_MAX
+2
+Poller plus reconciler; more is footprint without benefit
+ORACLE_CALL_TIMEOUT_MS
+15000
+A stuck query must not pile up connections
+POLL_INTERVAL_MS
+30000
+Business-hours freshness target
+POLL_INTERVAL_IDLE_MS
+120000
+Overnight
+POLL_INTERVAL_BURST_MS
+5000
+Used when the last cycle returned rows
+OVERLAP_SEC
+300
+Must exceed the observed commit lag from section 3. Do not lower without re-measuring.
+BACKFILL_DAYS
+30
+Cold-start window; nobody dashboards a P1 from last year
+LEASE_MS
+30000
+Failover time
+SWEEP_INTERVAL_MS
+900000
+15 min reconciliation
+SSE_BATCH_MS
+250
+Coalescing window
+SSE_MAX_CONN_PER_USER
+3
+Guards against reconnect loops
+PUSH_COOLDOWN_MS
+1800000
+Per-incident push suppression
+PRIORITY_CRITICAL / PRIORITY_HIGH
+0 / 1
+Confirm against section 3
+OVERLAP_SEC is the single most consequential value here. Too small and P1s vanish silently. Too large and a few extra rows get re-read each cycle, which costs nothing. When uncertain, go larger. The asymmetry is extreme: the downside of a generous overlap is a rounding error in database load; the downside of a tight one is a missed Sev-1 at a bank.
+11. Observability
+The dangerous failures in this system are the quiet ones. A crashed poller is obvious. A poller that runs every 30 seconds, returns zero rows, logs nothing unusual, and has silently skipped past a P1 is not. Instrument for that case specifically.
+Metrics to emit.
+Metric
+Type
+Alert
+poll_cycles_total
+counter
+—
+poll_rows_returned
+histogram
+—
+poll_duration_ms
+histogram
+p99 > 5s
+watermark_age_sec
+gauge — now - watermark
+> 300s: the watermark has stalled
+poll_errors_total
+counter
+3 consecutive
+reconcile_mismatch_count
+gauge
+> 0: the watermark logic has a hole
+reconcile_reaped_count
+gauge
+sudden spike
+sse_connections_active
+gauge
+—
+sse_events_sent_total
+counter
+—
+changestream_resume_failures
+counter
+> 0
+push_send_failures_total
+counter
+sustained
+end_to_end_latency_sec
+histogram — Oracle C6 to SSE emit
+p95 > 90s
+The two in bold are the ones that catch data loss. Wire them to the on-call channel, not a dashboard nobody opens.
+Logging. One structured line per poll cycle: { watermark_before, watermark_after, lower_bound, rows, duration_ms, leader }. When someone asks why a P1 did not appear, this line plus the sync_state document answers it in seconds.
+Health endpoints. /health/live (process up) and /health/ready (Oracle reachable, Mongo reachable, change stream attached). Report leadership status but do not fail readiness for a non-leader — standby pods are healthy.
+12. Security and bank constraints
+• Read-only Oracle account, scoped to the incident form's view only. No SELECT ANY TABLE, no write grants. The application must be incapable of modifying Remedy.
+• Credentials from the secret store (Vault, K8s secrets, or whatever ENBD standardises on). Never in the repo, config files, or container images.
+• TLS to Oracle, and mTLS between services if the platform supports it.
+• Field minimisation. Pull only what the dashboard renders. Remedy incident records can contain customer names, account numbers, and free-text descriptions with PII embedded. If the PWA shows a summary and an assignment group, do not sync the full work-log detail. Every field added is a field that now lives in a second datastore and a push payload.
+• Web Push payloads leave the bank's perimeter via Google's and Mozilla's push services. They are encrypted end-to-end, but the endpoint metadata is not. Keep payloads to an incident number and a generic title; fetch detail from the API after the user opens the app. Get this reviewed by infosec before launch, as it is the most likely point of objection.
+• Authentication on the SSE endpoint with the same SSO the PWA already uses. Note that browsers' native EventSource cannot send custom headers — use a cookie-based session, or the eventsource polyfill if bearer tokens are mandated.
+• Authorisation. If incident visibility is restricted by support group, filter server-side per connection. Do not fan out everything and filter in the client.
+• Audit logging of every Oracle query the service makes, if ENBD requires it for production database access.
+• Retention. Agree how long incident copies persist in Mongo. A TTL index on closed incidents is likely required by data-governance policy.
+13. Acceptance criteria and tests
+Correctness tests (the ones that matter)
+These must be automated against a seeded Oracle fixture or a mock. Each maps to a failure that is silent in production.
+1. Late commit is not lost. Seed a row with C6 = T, run a poll that stores watermark T + 1, then make the row visible. The next poll must return it. (Fails if the query uses > instead of >= watermark - OVERLAP_SEC.)
+2. Re-reading the overlap does not duplicate. Run three consecutive polls with no source changes. incidents document count and lastSyncedAt values must be unchanged after the first.
+3. Out-of-order arrival does not regress state. Apply a row with sourceTs = 100, then one with sourceTs = 50. The document must retain the sourceTs = 100 content.
+4. Crash between upsert and watermark write loses nothing. Kill the process after upsertIncidents resolves but before the sync_state update. On restart the same window is reprocessed and the outcome is identical.
+5. Empty result does not advance the watermark. Poll with no matching rows; sync_state.watermark must be byte-identical afterwards.
+6. Watermark never derives from local time. Skew the test container's clock 10 minutes ahead of the Oracle fixture. Behaviour must be unchanged.
+7. Two pods, one poller. Start three instances against one Mongo. Assert exactly one Oracle session and one poll per interval.
+8. Leader failover. SIGKILL the leader. Another pod must poll within LEASE_MS, with no duplicate or skipped window.
+9. Change-stream resume. Restart an API pod mid-flow; events produced during the gap must still reach a connected client.
+10. SSE replay. Disconnect a client, produce three events, reconnect with Last-Event-ID. All three arrive, in order, once.
+11. Push dedup. Update one P1 twenty times in a minute. Exactly one push is sent.
+12. Reconciler catches a planted drop. Manually delete a document from Mongo that exists in Oracle. The sweep must detect it, re-fetch it, and increment reconcile_mismatch_count.
+Performance gate
+Before production, capture a 24-hour comparison against the baseline from section 3: logical reads per hour, average and p99 poll duration, and peak concurrent Oracle sessions. The new design must show fewer logical reads per hour than the existing hourly job. If it does not, the index is not being used — stop and fix that before deploying.
+End-to-end gate
+Raise a real P1 in a Remedy test instance. Measure Remedy submit time to PWA render and to push delivery. Both must land under 60 seconds, with a median near 30.
+14. Build order and scope
+Milestones
+#
+Deliverable
+Gate to pass
+0
+remedy-schema.md — section 3 fully answered, commit lag measured, index confirmed
+Do not write poller code before this is done
+1
+Poller + watermark + Mongo upsert, single instance, no UI
+Correctness tests 1–6 green
+2
+Leader election, multi-pod
+Tests 7–8 green
+3
+Change stream + SSE, PWA consuming live
+Tests 9–10 green
+4
+Reconciliation sweep + metrics + alerts
+Test 12 green, dashboards live
+5
+Web Push
+Test 11 green, infosec sign-off
+6
+Performance gate, parallel run against the hourly job
+Section 13 gates
+Run the new pipeline alongside the existing hourly sync for at least a week, writing to a separate collection, and diff the two. Any divergence is a bug in the new path and must be explained before cutover.
+Out of scope
+• Writes back to Remedy. Read-only. Acknowledge, assign, and work-note flows are a separate project with a separate risk review.
+• P3 and P4. The filter is priority IN (0, 1). Widening it changes the volume profile and invalidates the performance work.
+• Historical reporting and analytics. This serves a live operational dashboard. Long-range reporting belongs in Remedy's own reporting layer.
+• Replacing the existing hourly job until milestone 6 passes.
+• CQN as a dependency. Optional optimisation only; the system must be fully correct without it.
+Two things the agent should push back on
+1. If the index on the modified-date column does not exist, stop and escalate. Every part of this plan assumes an index range scan. Polling every 30 seconds without one is worse than the hourly job it replaces.
+2. If OVERLAP_SEC is proposed to be reduced to "save load," reject it. The re-read costs a handful of rows. The failure it prevents is a missed P1.
